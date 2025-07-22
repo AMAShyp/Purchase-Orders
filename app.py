@@ -42,5 +42,7 @@ def dashboard() -> None:
 # ───────────────────────── Page router ───────────────────────────────── #
 if choice == "Dashboard":
     dashboard()
-else:  # "Upload"
+elif choice == "Upload":
     upload_page.page()
+else:  # "Reorder"
+    order_page.page()
