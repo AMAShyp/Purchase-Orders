@@ -3,16 +3,40 @@ import pandas as pd
 from io import StringIO, BytesIO
 from .upload_handler import upsert_dataframe, check_columns
 
-# ───────────────────────── Helpers ───────────────────────────────────── #
+# --------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------- #
 def read_file(file) -> pd.DataFrame:
+    """Return uploaded CSV/XLS(X) as DataFrame."""
     if file.type == "text/csv":
         return pd.read_csv(StringIO(file.getvalue().decode("utf-8")))
-    return pd.read_excel(BytesIO(file.getvalue()))  # xls/xlsx
+    return pd.read_excel(BytesIO(file.getvalue()))
 
 
-def upload_section(label: str, target_table: str) -> None:
+def make_template(columns: list[str]) -> bytes:
+    """Return an in-memory Excel file containing only headers."""
+    buf = BytesIO()
+    pd.DataFrame(columns=columns).to_excel(buf, index=False, engine="openpyxl")
+    buf.seek(0)
+    return buf.read()
+
+
+# --------------------------------------------------------------------- #
+# Re-usable upload section
+# --------------------------------------------------------------------- #
+def upload_section(label: str, target_table: str, required_cols: list[str]) -> None:
     st.subheader(label)
 
+    # --- Template download button ------------------------------------ #
+    st.download_button(
+        label="📄 Download Excel template",
+        data=make_template(required_cols),
+        file_name=f"{target_table}_template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=f"tmpl_{target_table}",
+    )
+
+    # --- File uploader ------------------------------------------------ #
     file = st.file_uploader(
         f"Choose CSV or Excel for **{label}**",
         key=f"{target_table}_uploader",
@@ -28,7 +52,7 @@ def upload_section(label: str, target_table: str) -> None:
     st.write("Preview:")
     st.dataframe(df, use_container_width=True, height=300)
 
-    # Basic column validation
+    # --- Validation --------------------------------------------------- #
     try:
         check_columns(df, target_table)
         valid = True
@@ -36,6 +60,7 @@ def upload_section(label: str, target_table: str) -> None:
         st.error(str(e))
         valid = False
 
+    # --- Commit button ------------------------------------------------ #
     if st.button("✅ Commit to DB", key=f"commit_{target_table}", disabled=not valid):
         with st.spinner("Inserting rows …"):
             try:
@@ -44,20 +69,43 @@ def upload_section(label: str, target_table: str) -> None:
                 st.error(f"Upload failed → {exc}")
             else:
                 st.success(f"Inserted {len(df)} rows into **{target_table}**.")
+
     st.divider()
 
 
-# ───────────────────────── Page entry point ──────────────────────────── #
+# --------------------------------------------------------------------- #
+# Page entry point
+# --------------------------------------------------------------------- #
 def page() -> None:
     st.title("⬆️ Bulk Uploads")
 
-    # Three independent sections
-    upload_section("Inventory Items", target_table="inventory")
-    upload_section("Daily Purchases", target_table="purchases")
-    upload_section("Daily Sales",     target_table="sales")
+    upload_section(
+        label="Inventory Items",
+        target_table="inventory",
+        required_cols=[
+            "item_name",
+            "item_barcode",
+            "category",
+            "initial_stock",
+            "current_stock",
+            "unit",
+        ],
+    )
+
+    upload_section(
+        label="Daily Purchases",
+        target_table="purchases",
+        required_cols=["item_id", "quantity", "purchase_price"],
+    )
+
+    upload_section(
+        label="Daily Sales",
+        target_table="sales",
+        required_cols=["item_id", "quantity", "sale_price"],
+    )
 
 
-# Optional: standalone run for quick local testing
+# Stand-alone test capability
 if __name__ == "__main__":
     st.set_page_config(page_title="Upload", page_icon="⬆️", layout="wide")
     page()
