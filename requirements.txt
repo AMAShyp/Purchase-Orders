@@ -1,0 +1,5 @@
+streamlit==1.47.0
+psycopg2-binary
+pandas
+SQLAlchemy
+python-dotenv
