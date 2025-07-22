@@ -1,12 +1,13 @@
 import streamlit as st
-from db_handler import fetch_dataframe
-# (no more SQLAlchemy imports here)
+import pandas as pd
+from sqlalchemy import text
+from db_handler import get_engine      # ← single import
 
 st.set_page_config(page_title="Hypermarket Inventory", page_icon="📦", layout="wide")
 
 @st.cache_data(ttl=60)
-def load_inventory():
-    sql = """
+def load_inventory() -> pd.DataFrame:
+    sql = text("""
         SELECT item_id,
                item_name,
                item_barcode,
@@ -16,9 +17,11 @@ def load_inventory():
                updated_at
         FROM inventory
         ORDER BY item_name;
-    """
-    return fetch_dataframe(sql)
+    """)
+    with get_engine().connect() as conn:
+        return pd.read_sql(sql, conn)
 
+# ────────── UI ──────────
 st.title("📦 Current Inventory Dashboard")
 
 df = load_inventory()
