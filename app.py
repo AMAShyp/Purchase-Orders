@@ -8,7 +8,7 @@ st.set_page_config(page_title="Hypermarket App", page_icon="📦", layout="wide"
 st.sidebar.title("Navigation")
 choice = st.sidebar.radio(
     "Go to",
-    ("Dashboard", "Upload"),
+    ("Dashboard", "Upload", "Reorder"),
     index=0,
 )
 
