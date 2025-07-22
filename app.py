@@ -1,30 +1,46 @@
 import streamlit as st
 from db_handler import fetch_dataframe
-# (no more SQLAlchemy imports here)
+from upload import upload as upload_page  # <- import the module, not the function
 
-st.set_page_config(page_title="Hypermarket Inventory", page_icon="📦", layout="wide")
+st.set_page_config(page_title="Hypermarket App", page_icon="📦", layout="wide")
 
-@st.cache_data(ttl=60)
-def load_inventory():
-    sql = """
-        SELECT item_id,
-               item_name,
-               item_barcode,
-               category,
-               current_stock,
-               unit,
-               updated_at
-        FROM inventory
-        ORDER BY item_name;
-    """
-    return fetch_dataframe(sql)
+# ───────────────────────── Sidebar navigation ────────────────────────── #
+st.sidebar.title("Navigation")
+choice = st.sidebar.radio(
+    "Go to",
+    ("Dashboard", "Upload"),
+    index=0,
+)
 
-st.title("📦 Current Inventory Dashboard")
+# ───────────────────────── Dashboard page ────────────────────────────── #
+def dashboard() -> None:
+    st.title("📦 Current Inventory Dashboard")
 
-df = load_inventory()
+    @st.cache_data(ttl=60)
+    def load_inventory():
+        sql = """
+            SELECT item_id,
+                   item_name,
+                   item_barcode,
+                   category,
+                   current_stock,
+                   unit,
+                   updated_at
+            FROM inventory
+            ORDER BY item_name;
+        """
+        return fetch_dataframe(sql)
 
-left, right = st.columns(2)
-left.metric("Distinct Items", len(df))
-right.metric("Total Units in Stock", int(df["current_stock"].sum()))
+    df = load_inventory()
 
-st.dataframe(df, use_container_width=True, hide_index=True)
+    left, right = st.columns(2)
+    left.metric("Distinct Items", len(df))
+    right.metric("Total Units in Stock", int(df["current_stock"].sum()))
+
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+# ───────────────────────── Page router ───────────────────────────────── #
+if choice == "Dashboard":
+    dashboard()
+else:  # "Upload"
+    upload_page.page()
