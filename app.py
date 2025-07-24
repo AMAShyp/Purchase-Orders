@@ -2,11 +2,6 @@ import streamlit as st
 import pandas as pd
 from db_handler import fetch_dataframe
 
-# Directly import the page functions ──────────────
-from upload.upload import page as upload_page
-from order.order   import page as order_page
-
-
 # ───────────────────────── Dashboard helper ─────────────────────────── #
 @st.cache_data(ttl=60)
 def load_inventory() -> pd.DataFrame:
@@ -50,11 +45,10 @@ if choice == "Dashboard":
     dashboard()
 
 elif choice == "Upload":
-    # ← import only when the user clicks “Upload”
+    # import only when needed → avoids circular-import timing issues
     from upload.upload import page as upload_page
     upload_page()
 
 else:  # "Reorder"
-    # ← import only when the user clicks “Reorder”
     from order.order import page as order_page
     order_page()
