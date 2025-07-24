@@ -1,3 +1,4 @@
+import importlib
 import streamlit as st
 import pandas as pd
 from db_handler import fetch_dataframe
@@ -45,10 +46,18 @@ if choice == "Dashboard":
     dashboard()
 
 elif choice == "Upload":
-    # import only when needed → avoids circular-import timing issues
-    from upload.upload import page as upload_page
-    upload_page()
+    # Lazy-import the page and surface any import errors
+    try:
+        upload_module = importlib.import_module("upload.upload")
+        upload_module.page()
+    except Exception as e:
+        st.error("❌ Failed to load *Upload* page:")
+        st.exception(e)
 
 else:  # "Reorder"
-    from order.order import page as order_page
-    order_page()
+    try:
+        order_module = importlib.import_module("order.order")
+        order_module.page()
+    except Exception as e:
+        st.error("❌ Failed to load *Reorder* page:")
+        st.exception(e)
