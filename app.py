@@ -42,13 +42,19 @@ st.set_page_config(page_title="Hypermarket App", page_icon="📦", layout="wide"
 st.sidebar.title("Navigation")
 choice = st.sidebar.radio(
     "Go to",
-    ("Dashboard", "Upload", "Reorder"),   # ← three pages
+    ("Dashboard", "Upload", "Reorder"),
     index=0,
 )
 
 if choice == "Dashboard":
     dashboard()
+
 elif choice == "Upload":
-    upload_page()       # function imported from upload.upload
+    # ← import only when the user clicks “Upload”
+    from upload.upload import page as upload_page
+    upload_page()
+
 else:  # "Reorder"
-    order_page()        # function imported from order.order
+    # ← import only when the user clicks “Reorder”
+    from order.order import page as order_page
+    order_page()
