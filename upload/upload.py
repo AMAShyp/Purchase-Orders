@@ -1,4 +1,3 @@
-@@ -1,112 +1,69 @@
 import streamlit as st
 import pandas as pd
 from io import StringIO, BytesIO
@@ -29,7 +28,6 @@ def upload_section(label: str, table: str, required_cols: list[str]) -> None:
         file_name=f"{table}_template.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key=f"tmpl_{table}",
-
     )
 
     file = st.file_uploader(
