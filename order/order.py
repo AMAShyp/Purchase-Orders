@@ -1,39 +1,56 @@
 import streamlit as st
 import pandas as pd
-from .order_handler import reorder_suggestions
+from .order_handler import reorder_suggestions, overstock_items
 
 
 def page() -> None:
-    st.title("📑 Reorder Suggestions")
+    st.title("📑 Stock Insights")
 
+    # ───────── Sidebar controls ───────── #
     with st.sidebar:
         st.header("Settings")
-        desired_days = st.slider("Target coverage (days)", 1, 30, 7)
+        desired_days = st.slider("Re‑order coverage (days)", 1, 30, 7)
+        overstock_days = st.slider("Over‑stock threshold (days)", 5, 60, 10)
         window_days = st.slider("Sales history window", 7, 60, 28, step=7)
 
-    df = reorder_suggestions(desired_days=desired_days, window_days=window_days)
+    # ───────── Re‑order section ───────── #
+    st.subheader("🛒 Items that need re‑ordering")
+    need_df = reorder_suggestions(desired_days, window_days)
 
-    st.write(
-        f"Items that need reordering to cover **{desired_days}** days "
-        f"(based on last **{window_days}** days of sales):"
-    )
+    if need_df.empty:
+        st.success("🚀 All items are sufficiently stocked for "
+                   f"{desired_days} days.")
+    else:
+        st.dataframe(need_df, use_container_width=True, height=350)
+        csv = need_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Download re‑order CSV",
+            data=csv,
+            file_name="reorder_suggestions.csv",
+            mime="text/csv",
+        )
 
-    if df.empty:
-        st.success("🚀 All items are sufficiently stocked!")
-        return
+    st.divider()
 
-    st.dataframe(df, use_container_width=True, height=500)
+    # ───────── Over‑stock section ───────── #
+    st.subheader("📦 Over‑stocked items")
+    over_df = overstock_items(overstock_days, window_days)
 
-    csv = df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "⬇️ Download CSV",
-        data=csv,
-        file_name="reorder_suggestions.csv",
-        mime="text/csv",
-    )
+    if over_df.empty:
+        st.success("🎉 No over‑stock detected for "
+                   f"the next {overstock_days} days.")
+    else:
+        st.dataframe(over_df, use_container_width=True, height=350)
+        csv_over = over_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Download over‑stock CSV",
+            data=csv_over,
+            file_name="overstock_items.csv",
+            mime="text/csv",
+        )
 
 
-# Optional standalone execution
+# standalone test
 if __name__ == "__main__":
-    st.set_page_config(page_title="Reorder", page_icon="📑", layout="wide")
+    st.set_page_config(page_title="Stock Insights", page_icon="📑", layout="wide")
     page()
