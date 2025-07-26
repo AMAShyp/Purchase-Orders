@@ -74,13 +74,19 @@ def upsert_dataframe(conn,
 
 # ───────────────────────── Purchases / Sales logic ──────────────────── #
 def _handle_purchases_or_sales(conn, df: pd.DataFrame, table: str) -> pd.DataFrame:
-    """Resolve IDs, create new items, adjust stock, then insert rows."""
+    """
+    Resolve IDs, create new items, adjust stock, then insert rows.
+    Ensures that for brand‑new items added via *purchases* we DON'T
+    double‑count the first quantity in current_stock.
+    """
     inv = fetch_dataframe("SELECT item_id, item_name, item_barcode FROM inventory")
     name2id = inv.set_index("item_name")["item_id"].to_dict()
     code2id = inv.set_index("item_barcode")["item_id"].to_dict()
 
-    # 1. Resolve / create item_id for every row ------------------------ #
-    new_items_payload = []
+    # Map to remember the qty we inserted as initial/current stock
+    inserted_qty: dict[int, int] = {}
+
+    # 1️⃣  Resolve / create item_id for every row --------------------- #
     for idx, row in df.iterrows():
         item_id = row.get("item_id")
         if not pd.isna(item_id):
@@ -89,8 +95,8 @@ def _handle_purchases_or_sales(conn, df: pd.DataFrame, table: str) -> pd.DataFra
         item_id = name2id.get(row.get("item_name")) \
               or code2id.get(row.get("item_barcode"))
 
-        # If still None → create new inventory row
-        if item_id is None:
+        # Still None → brand‑new item (only allowed during purchases)
+        if item_id is None and table == "purchases":
             qty = int(row["quantity"])
             ins = text(
                 "INSERT INTO inventory "
@@ -104,22 +110,34 @@ def _handle_purchases_or_sales(conn, df: pd.DataFrame, table: str) -> pd.DataFra
                  "code": row.get("item_barcode"),
                  "qty": qty}
             ).scalar_one()
-            # update maps for any subsequent rows referencing same item
+
+            inserted_qty[item_id] = qty          # remember
             name2id[row.get("item_name")] = item_id
             code2id[row.get("item_barcode")] = item_id
 
+        elif item_id is None and table == "sales":
+            raise ValueError(f"Sale row idx {idx} references unknown item.")
+
         df.at[idx, "item_id"] = item_id
 
-    # 2. Drop helper columns ------------------------------------------ #
+    # 2️⃣  Drop helper columns --------------------------------------- #
     df = df.drop(columns=[c for c in ("item_name", "item_barcode") if c in df.columns])
 
-    # 3. Insert purchase/sale rows ------------------------------------ #
+    # 3️⃣  Insert purchase/sale rows --------------------------------- #
     _insert_dataframe(conn, df, table)
 
-    # 4. Aggregate quantity per item and adjust stock ----------------- #
+    # 4️⃣  Aggregate quantity per item and adjust stock -------------- #
     sign = 1 if table == "purchases" else -1
     deltas = df.groupby("item_id")["quantity"].sum() * sign
+
     for item_id, delta in deltas.items():
+        # Avoid double‑adding the first purchase qty for brand‑new items
+        if table == "purchases" and item_id in inserted_qty:
+            delta -= inserted_qty[item_id]
+
+        if delta == 0:
+            continue  # nothing more to adjust
+
         conn.execute(
             text(
                 "UPDATE inventory "
@@ -129,7 +147,6 @@ def _handle_purchases_or_sales(conn, df: pd.DataFrame, table: str) -> pd.DataFra
             {"delta": int(delta), "id": int(item_id)},
         )
     return df
-
 # ───────────────────────── Generic INSERT helper ────────────────────── #
 def _insert_dataframe(conn, df: pd.DataFrame, table: str) -> None:
     cols = list(df.columns)
