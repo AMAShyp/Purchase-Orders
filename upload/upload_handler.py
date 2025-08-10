@@ -1,15 +1,13 @@
 """
-upload_handler.py – v6
-• Validates columns
-• Normalises date columns
-• Maps item_name / item_barcode → item_id
-• Auto-adds new items (on Purchase Invoice only)
-• Updates current_stock (+ for purchases, – for sales)
-• NEW: Inventory upload sanitation & validation (no blank names, non-negative stocks,
-       barcode normalization, defaults for category/unit)
+upload_handler.py – v7
+• Inventory upload: robust numeric parsing (commas, spaces, Arabic digits), strict validation,
+  barcode normalization, defaults for category/unit, no negative stocks.
+• Purchases/Sales: same as v6 (bill_type-aware stock updates & new-item creation),
+  plus date normalization.
 """
 
 from __future__ import annotations
+import re
 import pandas as pd
 from typing import Literal
 from sqlalchemy import text
@@ -38,7 +36,7 @@ def check_columns(df: pd.DataFrame,
     if missing:
         raise ValueError(f"Missing columns: {', '.join(sorted(missing))}")
 
-# ───────────────────────── Date normaliser ──────────────────────────── #
+# ───────────────────────── Dates ─────────────────────────────────────── #
 def _normalise_dates(df: pd.DataFrame, table: str) -> pd.DataFrame:
     for col in DATE_COLS.get(table, []):
         if col not in df.columns:
@@ -54,15 +52,39 @@ def _normalise_dates(df: pd.DataFrame, table: str) -> pd.DataFrame:
     return df
 
 # ───────────────────────── Inventory sanitizer ──────────────────────── #
+_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
+def _clean_number_like(s: str) -> str:
+    """
+    Convert common messy number strings to a standard form:
+    - translate Arabic/Extended Arabic digits → ASCII
+    - drop spaces and common thousands separators (comma, Arabic comma/sep)
+    - normalise Unicode minus to ASCII '-'
+    - keep digits and at most one dot
+    """
+    if s is None:
+        return ""
+    s = str(s).strip().translate(_ARABIC_DIGITS)
+    s = s.replace("٬", "").replace("،", "").replace(",", "").replace(" ", "")
+    s = s.replace("−", "-").replace("—", "-")
+    # remove any characters except digits, dot and minus
+    s = re.sub(r"[^0-9\.\-]", "", s)
+    # if multiple dots, keep first
+    if s.count(".") > 1:
+        first, *rest = s.split(".")
+        s = first + "." + "".join(rest)
+    return s
+
 def _sanitize_inventory(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(how="all")
     if df.empty:
         raise ValueError("No data rows found.")
 
-    # Trim strings & set defaults for optional text fields
+    # Ensure text columns are strings
     for col in ["item_name", "category", "unit"]:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip()
+
+    # Defaults
     if "category" in df.columns:
         df["category"] = df["category"].replace({"", "nan", "None"}, "Food")
     if "unit" in df.columns:
@@ -74,33 +96,39 @@ def _sanitize_inventory(df: pd.DataFrame) -> pd.DataFrame:
         bad_rows = df.index[name_blank].tolist()
         raise ValueError(f"Blank item_name in rows: {bad_rows}.")
 
-    # Normalise barcodes: keep None, else convert numbers like 12345.0 → '12345'
+    # Normalise barcodes: keep None, else int-like string
     if "item_barcode" in df.columns:
         def norm_bc(v):
             if pd.isna(v) or str(v).strip() == "":
                 return None
-            # try numeric → int string; else keep as stripped string
-            num = pd.to_numeric(v, errors="coerce")
+            num = pd.to_numeric(str(v).translate(_ARABIC_DIGITS).replace(" ", "").replace(",", ""), errors="coerce")
             if pd.isna(num):
                 return str(v).strip()
             return str(int(num))
         df["item_barcode"] = df["item_barcode"].apply(norm_bc)
 
-    # Coerce stocks to numeric and validate non-negative
+    # Robust numeric parse for stocks
     for col in ["initial_stock", "current_stock"]:
+        df[col] = df[col].apply(_clean_number_like)
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    if df[["initial_stock", "current_stock"]].isna().any().any():
-        bad_rows = df.index[
-            df["initial_stock"].isna() | df["current_stock"].isna()
-        ].tolist()
-        raise ValueError(f"Non-numeric initial/current stock in rows: {bad_rows}.")
 
+    # Report non-numeric rows with context
+    bad_mask = df["initial_stock"].isna() | df["current_stock"].isna()
+    if bad_mask.any():
+        bad_rows = df.index[bad_mask].tolist()
+        sample = df.loc[bad_mask, ["item_name", "initial_stock", "current_stock"]].head(10)
+        raise ValueError(
+            f"Non-numeric initial/current stock in rows: {bad_rows[:20]}.\n"
+            f"Examples:\n{sample.to_string(index=True)}"
+        )
+
+    # No negatives allowed for initial snapshot
     neg_mask = (df["initial_stock"] < 0) | (df["current_stock"] < 0)
     if neg_mask.any():
         bad_rows = df.index[neg_mask].tolist()
         raise ValueError(f"Negative stock values in rows: {bad_rows}.")
 
-    # Round to integers (inventory counts are whole units)
+    # Round to integers
     df["initial_stock"] = df["initial_stock"].round().astype(int)
     df["current_stock"] = df["current_stock"].round().astype(int)
 
@@ -120,11 +148,10 @@ def upsert_dataframe(conn,
     if table in ("purchases", "sales"):
         df = _handle_purchases_or_sales(conn, df, table)
     else:
-        # Inventory path: sanitize then insert
         clean = _sanitize_inventory(df)
         _insert_dataframe(conn, clean, "inventory")
 
-# ───────────────────────── Purchases / Sales logic ──────────────────── #
+# ───────────────────────── Purchases / Sales (unchanged logic) ──────── #
 def _row_sign(table: str, bill_type: str) -> int:
     bt = (bill_type or "").strip().lower()
     is_return = "return" in bt
