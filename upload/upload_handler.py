@@ -1,9 +1,9 @@
 """
-upload_handler.py – v7
-• Inventory upload: robust numeric parsing (commas, spaces, Arabic digits), strict validation,
-  barcode normalization, defaults for category/unit, no negative stocks.
-• Purchases/Sales: same as v6 (bill_type-aware stock updates & new-item creation),
-  plus date normalization.
+upload_handler.py – v8
+• Inventory upload: robust numeric parsing (commas, Arabic digits, spaces), defaults, no negatives,
+  barcode normalization, tolerant healing for missing initial/current stock.
+• Purchases/Sales: bill_type-aware stock updates, date normalization, and new-item creation
+  (only on Purchase Invoice, with initial_stock = current_stock = first qty; no double-count).
 """
 
 from __future__ import annotations
@@ -53,23 +53,16 @@ def _normalise_dates(df: pd.DataFrame, table: str) -> pd.DataFrame:
 
 # ───────────────────────── Inventory sanitizer ──────────────────────── #
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
+
 def _clean_number_like(s: str) -> str:
-    """
-    Convert common messy number strings to a standard form:
-    - translate Arabic/Extended Arabic digits → ASCII
-    - drop spaces and common thousands separators (comma, Arabic comma/sep)
-    - normalise Unicode minus to ASCII '-'
-    - keep digits and at most one dot
-    """
+    """Normalize common messy number strings."""
     if s is None:
         return ""
     s = str(s).strip().translate(_ARABIC_DIGITS)
     s = s.replace("٬", "").replace("،", "").replace(",", "").replace(" ", "")
     s = s.replace("−", "-").replace("—", "-")
-    # remove any characters except digits, dot and minus
-    s = re.sub(r"[^0-9\.\-]", "", s)
-    # if multiple dots, keep first
-    if s.count(".") > 1:
+    s = re.sub(r"[^0-9\.\-]", "", s)  # keep digits, dot, minus
+    if s.count(".") > 1:  # keep first dot
         first, *rest = s.split(".")
         s = first + "." + "".join(rest)
     return s
@@ -84,9 +77,10 @@ def _sanitize_inventory(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip()
 
-    # Defaults
+    # Defaults / clean-ups
     if "category" in df.columns:
         df["category"] = df["category"].replace({"", "nan", "None"}, "Food")
+        df.loc[df["category"].str.match(r"^\d+$", na=False), "category"] = "Food"
     if "unit" in df.columns:
         df["unit"] = df["unit"].replace({"", "nan", "None"}, "pcs")
 
@@ -96,15 +90,13 @@ def _sanitize_inventory(df: pd.DataFrame) -> pd.DataFrame:
         bad_rows = df.index[name_blank].tolist()
         raise ValueError(f"Blank item_name in rows: {bad_rows}.")
 
-    # Normalise barcodes: keep None, else int-like string
+    # Normalize barcodes → keep None or int-like string
     if "item_barcode" in df.columns:
         def norm_bc(v):
             if pd.isna(v) or str(v).strip() == "":
                 return None
             num = pd.to_numeric(str(v).translate(_ARABIC_DIGITS).replace(" ", "").replace(",", ""), errors="coerce")
-            if pd.isna(num):
-                return str(v).strip()
-            return str(int(num))
+            return str(int(num)) if not pd.isna(num) else str(v).strip()
         df["item_barcode"] = df["item_barcode"].apply(norm_bc)
 
     # Robust numeric parse for stocks
@@ -112,25 +104,22 @@ def _sanitize_inventory(df: pd.DataFrame) -> pd.DataFrame:
         df[col] = df[col].apply(_clean_number_like)
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Report non-numeric rows with context
-    bad_mask = df["initial_stock"].isna() | df["current_stock"].isna()
-    if bad_mask.any():
-        bad_rows = df.index[bad_mask].tolist()
-        sample = df.loc[bad_mask, ["item_name", "initial_stock", "current_stock"]].head(10)
-        raise ValueError(
-            f"Non-numeric initial/current stock in rows: {bad_rows[:20]}.\n"
-            f"Examples:\n{sample.to_string(index=True)}"
-        )
+    # Heal missing values
+    init_na = df["initial_stock"].isna()
+    curr_na = df["current_stock"].isna()
+    df.loc[init_na & ~curr_na, "initial_stock"] = df.loc[init_na & ~curr_na, "current_stock"]
+    df.loc[~init_na & curr_na, "current_stock"] = df.loc[~init_na & curr_na, "initial_stock"]
+    both_na = df["initial_stock"].isna() & df["current_stock"].isna()
+    df.loc[both_na, ["initial_stock", "current_stock"]] = 0
 
-    # No negatives allowed for initial snapshot
+    # Enforce non-negative integer counts
+    df["initial_stock"] = df["initial_stock"].fillna(0).round().astype(int)
+    df["current_stock"] = df["current_stock"].fillna(0).round().astype(int)
+
     neg_mask = (df["initial_stock"] < 0) | (df["current_stock"] < 0)
     if neg_mask.any():
         bad_rows = df.index[neg_mask].tolist()
         raise ValueError(f"Negative stock values in rows: {bad_rows}.")
-
-    # Round to integers
-    df["initial_stock"] = df["initial_stock"].round().astype(int)
-    df["current_stock"] = df["current_stock"].round().astype(int)
 
     return df
 
@@ -146,25 +135,31 @@ def upsert_dataframe(conn,
     df = _normalise_dates(df, table)
 
     if table in ("purchases", "sales"):
-        df = _handle_purchases_or_sales(conn, df, table)
+        _handle_purchases_or_sales(conn, df, table)
     else:
         clean = _sanitize_inventory(df)
         _insert_dataframe(conn, clean, "inventory")
 
-# ───────────────────────── Purchases / Sales (unchanged logic) ──────── #
+# ───────────────────────── Purchases / Sales logic ──────────────────── #
 def _row_sign(table: str, bill_type: str) -> int:
+    """
+    +1 / −1 for stock delta based on bill_type and table.
+    Purchases:  base +1; 'return' flips to −1.
+    Sales:      base −1; 'return' flips to +1.
+    """
     bt = (bill_type or "").strip().lower()
     is_return = "return" in bt
     base = 1 if table == "purchases" else -1
     return -base if is_return else base
 
-def _handle_purchases_or_sales(conn, df: pd.DataFrame, table: str) -> pd.DataFrame:
+def _handle_purchases_or_sales(conn, df: pd.DataFrame, table: str) -> None:
     inv = fetch_dataframe("SELECT item_id, item_name, item_barcode FROM inventory")
     name2id = inv.set_index("item_name")["item_id"].to_dict()
     code2id = inv.set_index("item_barcode")["item_id"].to_dict()
 
     inserted_qty: dict[int, int] = {}
 
+    # Resolve item_id and compute sign
     for idx, row in df.iterrows():
         sign = _row_sign(table, row.get("bill_type"))
         df.at[idx, "__sign"] = sign
@@ -178,11 +173,11 @@ def _handle_purchases_or_sales(conn, df: pd.DataFrame, table: str) -> pd.DataFra
 
         if item_id is None:
             if table == "purchases" and sign > 0:
-                qty = int(row["quantity"])
+                qty = int(pd.to_numeric(row["quantity"], errors="coerce") or 0)
                 ins = text(
                     "INSERT INTO inventory "
                     "(item_name, item_barcode, category, initial_stock, current_stock, unit) "
-                    "VALUES (:name, :code, 'food', :qty, :qty, 'Psc') "
+                    "VALUES (:name, :code, 'food', :qty, :qty, 'pcs') "
                     "RETURNING item_id;"
                 )
                 item_id = conn.execute(
@@ -201,23 +196,27 @@ def _handle_purchases_or_sales(conn, df: pd.DataFrame, table: str) -> pd.DataFra
 
         df.at[idx, "item_id"] = item_id
 
+    # Quantity & deltas
     df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0).astype(int)
     df["_delta"] = df["quantity"] * df["__sign"]
 
+    # Compute aggregate deltas BEFORE dropping helper columns
+    deltas = df.groupby("item_id")["_delta"].sum()
+
+    # Insert rows (drop helper columns)
     drop_cols = [c for c in ("item_name", "item_barcode", "__sign", "_delta") if c in df.columns]
     _insert_dataframe(conn, df.drop(columns=drop_cols), table)
 
-    deltas = df.groupby("item_id")["_delta"].sum()
+    # Adjust inventory current_stock
     for item_id, delta in deltas.items():
         if table == "purchases" and item_id in inserted_qty:
-            delta -= inserted_qty[item_id]
+            delta -= inserted_qty[item_id]  # avoid double-counting first purchase
         if delta == 0:
             continue
         conn.execute(
             text("UPDATE inventory SET current_stock = current_stock + :d WHERE item_id = :i;"),
             {"d": int(delta), "i": int(item_id)},
         )
-    return df
 
 # ───────────────────────── Generic INSERT helper ────────────────────── #
 def _insert_dataframe(conn, df: pd.DataFrame, table: str) -> None:
