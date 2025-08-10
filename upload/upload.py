@@ -16,6 +16,7 @@ def _make_template(columns):
     return buf.read()
 
 def _preview_fix(df: pd.DataFrame, table: str) -> pd.DataFrame:
+    """Coerce text cols to strings & reorder for a clean preview."""
     df = df.copy()
     if table == "inventory":
         for c in ["item_name", "item_barcode", "category", "unit"]:
@@ -32,7 +33,6 @@ def _preview_fix(df: pd.DataFrame, table: str) -> pd.DataFrame:
             if c in df.columns:
                 df[c] = df[c].astype(str)
         order = ["bill_type", "sale_date", "item_name", "item_barcode", "quantity", "sale_price"]
-    # Reorder if all present
     present = [c for c in order if c in df.columns]
     return df[present + [c for c in df.columns if c not in present]]
 
@@ -46,6 +46,11 @@ def _section(label, table, required_cols):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key=f"tmpl_{table}",
     )
+
+    if table in ("purchases", "sales"):
+        st.caption("Allowed bill types (case-insensitive): "
+                   "Sales Invoice / Sales Return Invoice, "
+                   "Purchase Invoice / Purchase Return Invoice.")
 
     file = st.file_uploader(
         f"Choose CSV or Excel for **{label}**",
@@ -78,27 +83,32 @@ def _section(label, table, required_cols):
                 st.success(f"Inserted {len(df)} rows into **{table}**.")
     st.divider()
 
+# ---------- PAGE ENTRY POINT ----------
 def page() -> None:
     st.title("⬆️ Bulk Uploads")
 
+    # Inventory: item_name, item_barcode, category, unit, initial_stock, current_stock
     _section(
         "Inventory Items",
         "inventory",
         ["item_name", "item_barcode", "category", "unit", "initial_stock", "current_stock"],
     )
 
+    # Purchases: bill_type, purchase_date, item_name, item_barcode, quantity, purchase_price
     _section(
         "Daily Purchases",
         "purchases",
         ["bill_type", "purchase_date", "item_name", "item_barcode", "quantity", "purchase_price"],
     )
 
+    # Sales: bill_type, sale_date, item_name, item_barcode, quantity, sale_price
     _section(
         "Daily Sales",
         "sales",
         ["bill_type", "sale_date", "item_name", "item_barcode", "quantity", "sale_price"],
     )
 
+# standalone test
 if __name__ == "__main__":
     st.set_page_config(page_title="Upload", page_icon="⬆️", layout="wide")
     page()
