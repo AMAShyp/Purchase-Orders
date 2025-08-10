@@ -9,13 +9,11 @@ def _read_file(file):
         return pd.read_csv(StringIO(file.getvalue().decode("utf-8")))
     return pd.read_excel(BytesIO(file.getvalue()))
 
-
 def _make_template(columns):
     buf = BytesIO()
     pd.DataFrame(columns=columns).to_excel(buf, index=False, engine="openpyxl")
     buf.seek(0)
     return buf.read()
-
 
 def _section(label, table, required_cols):
     st.subheader(label)
@@ -27,6 +25,9 @@ def _section(label, table, required_cols):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key=f"tmpl_{table}",
     )
+    # (Optional) hint
+    if table in ("purchases", "sales"):
+        st.caption("Tip: Dates like 2025-07-25 are safest. Other formats are parsed too.")
 
     file = st.file_uploader(
         f"Choose CSV or Excel for **{label}**",
@@ -59,29 +60,30 @@ def _section(label, table, required_cols):
                 st.success(f"Inserted {len(df)} rows into **{table}**.")
     st.divider()
 
-
 # ---------- PAGE ENTRY POINT ----------
 def page() -> None:          # <-- must exist at top level
     st.title("⬆️ Bulk Uploads")
 
+    # Inventory: item_name, item_barcode, category, unit, initial_stock, current_stock
     _section(
         "Inventory Items",
         "inventory",
-        ["item_name", "item_barcode", "category", "initial_stock", "current_stock", "unit"],
+        ["item_name", "item_barcode", "category", "unit", "initial_stock", "current_stock"],
     )
 
+    # Purchases: purchase_date, item_name, item_barcode, quantity, purchase_price
     _section(
         "Daily Purchases",
         "purchases",
-        ["item_name", "item_barcode", "quantity", "purchase_price", "purchase_date"],
+        ["purchase_date", "item_name", "item_barcode", "quantity", "purchase_price"],
     )
 
+    # Sales: sale_date, item_name, item_barcode, quantity, sale_price
     _section(
         "Daily Sales",
         "sales",
-        ["item_name", "item_barcode", "quantity", "sale_price", "sale_date"],
+        ["sale_date", "item_name", "item_barcode", "quantity", "sale_price"],
     )
-
 
 # standalone test
 if __name__ == "__main__":
