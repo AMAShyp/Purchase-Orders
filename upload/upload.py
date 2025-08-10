@@ -5,10 +5,12 @@ from .upload_handler import upsert_dataframe, check_columns
 
 # ---------- helpers ----------
 def _read_file(file):
-    # Read as text for CSV; for Excel read as strings to preserve barcodes
+    # Read everything as strings so barcodes keep leading zeros and don't become 8.69E+12
     if file.type == "text/csv":
-        return pd.read_csv(StringIO(file.getvalue().decode("utf-8")))
-    return pd.read_excel(BytesIO(file.getvalue()), dtype=str, engine="openpyxl")
+        return pd.read_csv(StringIO(file.getvalue().decode("utf-8")),
+                           dtype=str, keep_default_na=False)
+    return pd.read_excel(BytesIO(file.getvalue()),
+                         dtype=str, engine="openpyxl")
 
 def _make_template(columns):
     buf = BytesIO()
@@ -82,12 +84,11 @@ def _section(label, table, required_cols):
                 st.error(f"Upload failed → {exc}")
             else:
                 if table == "inventory":
-                    msg = (
+                    st.success(
                         f"✅ Done.\n\n"
                         f"- Written (inserted/updated): **{result['written']}** rows\n"
                         f"- Skipped due to duplicate barcodes: **{result['skipped_barcode']}**"
                     )
-                    st.success(msg)
                     if result.get("skipped_rows"):
                         buf = BytesIO()
                         pd.DataFrame(result["skipped_rows"]).to_csv(buf, index=False)
