@@ -25,9 +25,11 @@ def _section(label, table, required_cols):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key=f"tmpl_{table}",
     )
-    # (Optional) hint
+
     if table in ("purchases", "sales"):
-        st.caption("Tip: Dates like 2025-07-25 are safest. Other formats are parsed too.")
+        st.caption("Allowed bill types (case-insensitive): "
+                   "Sales Invoice, Sales Return Invoice, "
+                   "Purchase Invoice, Purchase Return Invoice.")
 
     file = st.file_uploader(
         f"Choose CSV or Excel for **{label}**",
@@ -61,7 +63,7 @@ def _section(label, table, required_cols):
     st.divider()
 
 # ---------- PAGE ENTRY POINT ----------
-def page() -> None:          # <-- must exist at top level
+def page() -> None:
     st.title("⬆️ Bulk Uploads")
 
     # Inventory: item_name, item_barcode, category, unit, initial_stock, current_stock
@@ -71,21 +73,20 @@ def page() -> None:          # <-- must exist at top level
         ["item_name", "item_barcode", "category", "unit", "initial_stock", "current_stock"],
     )
 
-    # Purchases: purchase_date, item_name, item_barcode, quantity, purchase_price
+    # Purchases: bill_type, purchase_date, item_name, item_barcode, quantity, purchase_price
     _section(
         "Daily Purchases",
         "purchases",
-        ["purchase_date", "item_name", "item_barcode", "quantity", "purchase_price"],
+        ["bill_type", "purchase_date", "item_name", "item_barcode", "quantity", "purchase_price"],
     )
 
-    # Sales: sale_date, item_name, item_barcode, quantity, sale_price
+    # Sales: bill_type, sale_date, item_name, item_barcode, quantity, sale_price
     _section(
         "Daily Sales",
         "sales",
-        ["sale_date", "item_name", "item_barcode", "quantity", "sale_price"],
+        ["bill_type", "sale_date", "item_name", "item_barcode", "quantity", "sale_price"],
     )
 
-# standalone test
 if __name__ == "__main__":
     st.set_page_config(page_title="Upload", page_icon="⬆️", layout="wide")
     page()
