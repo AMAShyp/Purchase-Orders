@@ -1,20 +1,27 @@
+# page_uploads.py
+# Streamlit UI for bulk uploads (inventory, purchases, sales) with granular debug
 import streamlit as st
 import pandas as pd
 from io import StringIO, BytesIO
-from .upload_handler import upsert_dataframe, check_columns
+from typing import List, Tuple, Optional, Dict, Any
+
+from upload_handler import (
+    upsert_dataframe,
+    check_columns,
+    DebugSink,
+)
 from db_handler import fetch_dataframe
 
 MAX_NAME_LEN = 255
 MAX_BARCODE_LEN = 128
-PREVIEW_ROWS = 200  # cap preview to speed up UI
 
 # ---------- file I/O ----------
-def _read_file(file):
+def _read_file(file) -> pd.DataFrame:
     if file.type == "text/csv":
         return pd.read_csv(StringIO(file.getvalue().decode("utf-8")))
     return pd.read_excel(BytesIO(file.getvalue()))
 
-def _make_template(columns):
+def _make_template(columns: List[str]) -> bytes:
     buf = BytesIO()
     pd.DataFrame(columns=columns).to_excel(buf, index=False, engine="openpyxl")
     buf.seek(0)
@@ -30,7 +37,7 @@ def _normalize_barcode(series: pd.Series) -> pd.Series:
 
 # ---------- preview: make Arrow-friendly ----------
 def _arrow_friendly_preview(df: pd.DataFrame, table: str) -> pd.DataFrame:
-    preview = df.head(PREVIEW_ROWS).copy()  # only first N rows
+    preview = df.copy()
     text_cols = {
         "inventory": ["item_name", "item_barcode", "category", "unit"],
         "purchases": ["bill_type", "item_name", "item_barcode"],
@@ -43,7 +50,7 @@ def _arrow_friendly_preview(df: pd.DataFrame, table: str) -> pd.DataFrame:
     return preview
 
 # ---------- inventory duplicate policy ----------
-def _filter_inventory_conflicts(df: pd.DataFrame):
+def _filter_inventory_conflicts(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     name_norm = _normalize_name(df["item_name"])
     code_norm = _normalize_barcode(df.get("item_barcode", ""))
 
@@ -72,7 +79,7 @@ def _filter_inventory_conflicts(df: pd.DataFrame):
     return filtered, skipped
 
 # ---------- length guard ----------
-def _validate_inventory_lengths(df: pd.DataFrame):
+def _validate_inventory_lengths(df: pd.DataFrame) -> Tuple[bool, pd.DataFrame]:
     name = df["item_name"].fillna("").astype(str)
     code = _normalize_barcode(df.get("item_barcode", pd.Series([], dtype="object")))
 
@@ -99,16 +106,42 @@ def _validate_inventory_lengths(df: pd.DataFrame):
 
     return False, df
 
+# ---------- Debug UI helpers ----------
+def _show_debug(title: str, logs: List[str]):
+    if not logs:
+        return
+    with st.expander(title, expanded=False):
+        for ln in logs:
+            st.text(ln)
+
+def _pre_snapshot(table: str) -> Optional[pd.DataFrame]:
+    try:
+        return fetch_dataframe(f"SELECT COUNT(*) AS c FROM {table};")
+    except Exception:
+        return None
+
+def _post_snapshot(table: str) -> Optional[pd.DataFrame]:
+    try:
+        return fetch_dataframe(f"SELECT COUNT(*) AS c FROM {table};")
+    except Exception:
+        return None
+
 # ---------- section ----------
-def _section(label, table, required_cols):
+def _section(label: str, table: str, required_cols: List[str]):
     st.subheader(label)
-    st.download_button(
-        "📄 Download Excel template",
-        data=_make_template(required_cols),
-        file_name=f"{table}_template.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key=f"tmpl_{table}",
-    )
+
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        st.download_button(
+            "📄 Download Excel template",
+            data=_make_template(required_cols),
+            file_name=f"{table}_template.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"tmpl_{table}",
+        )
+
+    with c2:
+        st.caption("Template includes required columns only. You can add optional columns if your DB has them.")
 
     file = st.file_uploader(
         f"Choose CSV or Excel for **{label}**",
@@ -120,36 +153,41 @@ def _section(label, table, required_cols):
         st.divider()
         return
 
-    df = _read_file(file)
-    st.info(f"Loaded file with {df.shape[0]} rows and {df.shape[1]} columns.")
-    st.write("Preview (first {PREVIEW_ROWS} rows):")
-    st.dataframe(_arrow_friendly_preview(df, table), use_container_width=True, height=300)
-    with st.expander("Show full file (may be slow)"):
-        st.dataframe(_arrow_friendly_preview(df if len(df) <= 5000 else df.sample(5000), table),
-                     use_container_width=True, height=300)
+    # BEFORE: snapshot table count
+    before = _pre_snapshot(table)
+    if before is not None:
+        st.info(f"🔎 Before insert → `{table}` rows: {int(before['c'].iloc[0])}")
 
+    # Load & preview
+    df = _read_file(file)
+    st.info(f"📥 Loaded file with {df.shape[0]} rows and {df.shape[1]} columns.")
+    st.dataframe(_arrow_friendly_preview(df, table), use_container_width=True, height=300)
+
+    # Validate columns
     try:
-        check_columns(df, table)
+        check_columns(df, table)  # raises on error
         valid = True
         st.success("✅ Column check passed.")
     except ValueError as e:
         st.error(f"❌ Column check failed: {e}")
         valid = False
 
+    # Inventory-only extra checks
     df_to_commit = df
     if valid and table == "inventory":
         if (df["item_name"].astype(str).str.strip() == "").any() or df["item_name"].isna().any():
             st.error("❌ All inventory rows must have a non-empty item_name. Barcode can be blank.")
             valid = False
         else:
-            valid, df_lenfixed = _validate_inventory_lengths(df)
+            ok_len, df_lenfixed = _validate_inventory_lengths(df)
             st.info(f"After length check: {df_lenfixed.shape[0]} rows remain.")
-            if valid:
+            if ok_len:
                 filtered, skipped = _filter_inventory_conflicts(df_lenfixed)
                 st.info(f"After duplicate filtering: {filtered.shape[0]} rows to insert, {skipped.shape[0]} skipped.")
                 if not skipped.empty:
                     st.warning("⚠️ Skipped rows due to both name & barcode duplicate.")
-                    st.dataframe(_arrow_friendly_preview(skipped, "inventory"), use_container_width=True, height=200)
+                    st.dataframe(_arrow_friendly_preview(skipped, "inventory"),
+                                 use_container_width=True, height=200)
                 if filtered.empty:
                     st.error("❌ No rows left to insert after filtering.")
                     valid = False
@@ -158,33 +196,52 @@ def _section(label, table, required_cols):
                     if "item_barcode" in filtered.columns:
                         bc = _normalize_barcode(filtered["item_barcode"])
                         filtered["item_barcode"] = bc.mask(bc.str.strip() == "", pd.NA)
-                    st.info("Final data to commit (first rows):")
-                    st.dataframe(_arrow_friendly_preview(filtered, "inventory"), use_container_width=True, height=300)
+                    st.info("Final data to commit:")
+                    st.dataframe(_arrow_friendly_preview(filtered, "inventory"),
+                                 use_container_width=True, height=300)
                     df_to_commit = filtered
 
-    if st.button("✅ Commit to DB", key=f"commit_{table}", disabled=not valid):
-        with st.spinner("Inserting rows into DB…"):
+    # Commit
+    dbg = DebugSink()
+    commit_btn = st.button("✅ Commit to DB", key=f"commit_{table}", disabled=not valid, type="primary")
+    if commit_btn:
+        with st.status("Running bulk insert…", expanded=True) as status:
+            st.write("• Validating and normalising data…")
             try:
-                upsert_dataframe(df=df_to_commit, table=table)
-                st.success(f"✅ Inserted {len(df_to_commit)} rows into **{table}**.")
+                # Let the handler run everything inside one DB transaction
+                upsert_dataframe(df=df_to_commit, table=table, debug=dbg)
+                st.write("• Insert statements executed.")
+                status.update(label="Commit successful ✅", state="complete")
+
+                # AFTER: snapshot table count
+                after = _post_snapshot(table)
+                if after is not None:
+                    st.info(f"📊 After insert → `{table}` rows: {int(after['c'].iloc[0])}")
+                # Show last 5 rows for quick sanity
                 try:
-                    count_df = fetch_dataframe(f"SELECT COUNT(*) AS total FROM {table};")
-                    st.info(f"📊 Table `{table}` now has {int(count_df['total'].iloc[0])} total rows.")
-                    if table == "inventory":
-                        last_rows = fetch_dataframe("SELECT * FROM inventory ORDER BY item_id DESC LIMIT 5;")
-                    else:
-                        last_rows = fetch_dataframe(f"SELECT * FROM {table} ORDER BY 1 DESC LIMIT 5;")
-                    st.write("Last few rows:")
+                    st.write("Here are the last 5 rows in the table:")
+                    last_rows = fetch_dataframe(
+                        f"SELECT * FROM {table} ORDER BY item_id DESC LIMIT 5;" if table == "inventory"
+                        else f"SELECT * FROM {table} ORDER BY 1 DESC LIMIT 5;"
+                    )
                     st.dataframe(last_rows, use_container_width=True)
                 except Exception as dbg_err:
                     st.warning(f"Post-insert debug query failed: {dbg_err}")
+
             except Exception as exc:
+                status.update(label="Commit failed ❌", state="error")
                 st.error(f"❌ Upload failed → {exc}")
+
+        # Always show detailed internal logs
+        _show_debug("🪵 Detailed debug log (from transaction)", dbg.dump())
+
     st.divider()
 
 # ---------- PAGE ENTRY POINT ----------
 def page():
-    st.title("⬆️ Bulk Uploads")
+    st.title("⬆️ Bulk Uploads (with Full Debug)")
+    st.caption("Upload Excel/CSV to insert rows into the database. Every step is logged for visibility.")
+
     _section(
         "Inventory Items",
         "inventory",
