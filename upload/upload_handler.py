@@ -1,8 +1,9 @@
-# upload_handler.py – FAST v1.2
+# upload_handler.py – FAST v1.3
 # Bulk insert using COPY with:
-# - subset header mode (only provided columns are inserted, no extras)
-# - auto numeric coercion (commas/decimals -> integer for integer columns)
+# - subset header mode (only provided columns are inserted; all must exist in table)
+# - auto numeric coercion (commas/decimals → integer for integer columns; numeric kept numeric)
 # - ignores auto/default columns (e.g., item_id, created_at, updated_at) if not provided
+# - signature compatible with run_transaction(conn, ...)
 
 from __future__ import annotations
 
@@ -79,17 +80,18 @@ def _coerce_numeric_like(df: pd.DataFrame, cols: List[str], as_int: bool) -> Non
         if c not in df.columns:
             continue
         s = df[c]
-        if s.dtype.kind in "biufc":  # already numeric
+        # Already numeric?
+        if s.dtype.kind in "biufc":
             if as_int:
                 df[c] = pd.to_numeric(s, errors="coerce").fillna(0).round(0).astype("Int64")
             else:
                 df[c] = pd.to_numeric(s, errors="coerce")
             continue
-        # string/object -> clean
+        # String-like → clean and parse
         s2 = s.astype(str).map(lambda x: _num_clean_re.sub("", x))
         s_num = pd.to_numeric(s2, errors="coerce")
         if as_int:
-            df[c] = s_num.fillna(0).round(0).astype("Int64")  # banker's rounding; fast
+            df[c] = s_num.fillna(0).round(0).astype("Int64")
         else:
             df[c] = s_num
 
@@ -114,9 +116,9 @@ def _to_csv_buffer(df: pd.DataFrame) -> io.StringIO:
 # ───────────────────────── public API ───────────────────────── #
 
 @run_transaction
-def bulk_insert_exact_headers(df: pd.DataFrame, table: str, conn=None, schema: str = "public") -> Dict[str, Any]:
+def bulk_insert_exact_headers(conn, *, df: pd.DataFrame, table: str, schema: str = "public") -> Dict[str, Any]:
     """
-    Fast subset-header bulk insert:
+    Fast subset-header bulk insert (decorator injects `conn` first):
       - Reads DB columns (ordered)
       - Uses only columns present in the file (must all exist in table)
       - Auto-coerces numeric/integer columns for compatibility
@@ -138,17 +140,16 @@ def bulk_insert_exact_headers(df: pd.DataFrame, table: str, conn=None, schema: s
     if df.empty:
         raise ValueError("No data rows found.")
     used_cols = _align_subset_columns(df, db_cols)
-    df2 = df[[c for c in df.columns if c.lower() in {u.lower() for u in used_cols}]].copy()
 
-    # rename to exact DB casing
+    # Build df2 with only used columns, rename to exact DB casing, ordered by DB
     lower2db = {c.lower(): c for c in db_cols}
+    present_lower = {c.lower() for c in used_cols}
+    df2 = df[[c for c in df.columns if c.lower() in present_lower]].copy()
     df2.rename(columns={c: lower2db[c.lower()] for c in df2.columns}, inplace=True)
-    # project in DB order
     df2 = df2[used_cols]
     timings["align_columns_ms"] = (time.perf_counter() - t) * 1000
 
     # 3) Numeric coercion for any numeric columns present in file
-    #    (inventory: initial_stock/current_stock -> integer)
     t = time.perf_counter()
     present_int = [c for c in used_cols if c in int_cols]
     present_num = [c for c in used_cols if c in num_cols]
@@ -187,11 +188,14 @@ def bulk_insert_exact_headers(df: pd.DataFrame, table: str, conn=None, schema: s
     timings["total_ms"] = (time.perf_counter() - t0) * 1000
     return {"rows": rows, "used_copy": used_copy, "timings": timings, "used_columns": used_cols}
 
+
 def get_row_count(table: str, schema: str = "public") -> int:
     q = f'SELECT COUNT(*) FROM "{schema}"."{table}"'
     df = fetch_dataframe(q)
     return int(df.iloc[0, 0])
 
-# Back-compat alias for older imports
-def upsert_dataframe(*, df: pd.DataFrame, table: str, **kwargs) -> Dict[str, Any]:
-    return bulk_insert_exact_headers(df=df, table=table)
+
+# Back-compat alias for older imports (`upsert_dataframe(df=..., table=...)`)
+@run_transaction
+def upsert_dataframe(conn, *, df: pd.DataFrame, table: str, schema: str = "public") -> Dict[str, Any]:
+    return bulk_insert_exact_headers(conn, df=df, table=table, schema=schema)
