@@ -5,7 +5,7 @@ from .upload_handler import upsert_dataframe, check_columns
 from db_handler import fetch_dataframe  # for DB duplicate checks
 
 
-# ---------- file I/O ----------
+# ---------- helpers ----------
 def _read_file(file):
     if file.type == "text/csv":
         return pd.read_csv(StringIO(file.getvalue().decode("utf-8")))
@@ -17,38 +17,19 @@ def _make_template(columns):
     buf.seek(0)
     return buf.read()
 
-
-# ---------- normalizers ----------
 def _normalize_name(series: pd.Series) -> pd.Series:
+    # lowercased, trimmed
     return series.fillna("").astype(str).str.strip().str.casefold()
 
 def _normalize_barcode(series: pd.Series) -> pd.Series:
+    # text, trimmed, drop trailing ".0" (Excel artifact)
     s = series.fillna("").astype(str).str.strip()
     return s.str.replace(r"\.0$", "", regex=True)
 
-
-# ---------- preview: make Arrow-friendly without touching original df ----------
-def _arrow_friendly_preview(df: pd.DataFrame, table: str) -> pd.DataFrame:
-    """Coerce likely text columns to strings so Streamlit/Arrow can render safely."""
-    preview = df.copy()
-    text_cols = {
-        "inventory": ["item_name", "item_barcode", "category", "unit"],
-        "purchases": ["bill_type", "item_name", "item_barcode"],
-        "sales":     ["bill_type", "item_name", "item_barcode"],
-    }.get(table, [])
-    for col in text_cols:
-        if col in preview.columns:
-            preview[col] = preview[col].astype(str).where(preview[col].notna(), "")
-            # avoid literal 'nan'
-            preview[col] = preview[col].replace({"nan": ""})
-    return preview
-
-
-# ---------- inventory duplicate policy ----------
 def _filter_inventory_conflicts(df: pd.DataFrame):
     """
-    Skip rows ONLY when BOTH item_name AND (non-empty) item_barcode are duplicates
-    (either within the file OR versus DB). Empty barcode never blocks.
+    Skip rows ONLY when BOTH item_name AND item_barcode are duplicates
+    (within file OR vs DB). Empty barcode never blocks the row.
     Returns (filtered_df, skipped_df).
     """
     dfc = df.copy()
@@ -56,11 +37,11 @@ def _filter_inventory_conflicts(df: pd.DataFrame):
     name_norm = _normalize_name(dfc["item_name"])
     code_norm = _normalize_barcode(dfc.get("item_barcode", ""))
 
-    # dups within file
+    # Dups within file
     dup_name_file = name_norm.map(name_norm.value_counts()).gt(1) & name_norm.ne("")
     dup_code_file = code_norm.map(code_norm.value_counts()).gt(1) & code_norm.ne("")
 
-    # dups vs DB
+    # Dups vs DB
     try:
         existing = fetch_dataframe("SELECT item_name, item_barcode FROM inventory;")
         db_names = set(_normalize_name(existing["item_name"]))
@@ -74,7 +55,7 @@ def _filter_inventory_conflicts(df: pd.DataFrame):
     name_dup_any = dup_name_file | dup_name_db
     code_dup_any = dup_code_file | dup_code_db
 
-    # empty barcode never blocks; need BOTH to be dup to skip
+    # If barcode is empty, do NOT consider it a duplicate blocker
     barcode_nonempty = code_norm.ne("")
     both_dup_mask = name_dup_any & code_dup_any & barcode_nonempty
 
@@ -82,8 +63,6 @@ def _filter_inventory_conflicts(df: pd.DataFrame):
     filtered = dfc[~both_dup_mask].copy()
     return filtered, skipped
 
-
-# ---------- section ----------
 def _section(label, table, required_cols):
     st.subheader(label)
 
@@ -111,13 +90,10 @@ def _section(label, table, required_cols):
         return
 
     df = _read_file(file)
-
-    # Arrow-friendly preview (does NOT affect df used for insert)
-    preview = _arrow_friendly_preview(df, table)
     st.write("Preview:")
-    st.dataframe(preview, use_container_width=True, height=300)
+    st.dataframe(df, use_container_width=True, height=300)
 
-    # Schema validation
+    # Schema validation (columns must exist; values can be blank)
     try:
         check_columns(df, table)
         valid = True
@@ -125,11 +101,11 @@ def _section(label, table, required_cols):
         st.error(str(e))
         valid = False
 
-    # Inventory-specific duplicate filtering
+    # Inventory-specific duplicate policy
     df_to_commit = df
     if valid and table == "inventory":
-        # Require non-empty item_name; barcode may be blank
-        if (df["item_name"].astype(str).str.strip() == "").any() or df["item_name"].isna().any():
+        # Require item_name (barcode optional)
+        if df["item_name"].isna().any() | (df["item_name"].astype(str).str.strip() == "").any():
             st.error("All inventory rows must have a non-empty item_name. Barcode can be blank.")
             valid = False
         else:
@@ -141,8 +117,7 @@ def _section(label, table, required_cols):
                     "duplicate are allowed."
                 )
                 with st.expander("Show skipped rows"):
-                    st.dataframe(_arrow_friendly_preview(skipped, "inventory"),
-                                 use_container_width=True, height=220)
+                    st.dataframe(skipped, use_container_width=True, height=220)
             if filtered.empty:
                 st.info("After skipping conflicting rows, there is nothing to insert.")
                 valid = False
@@ -159,23 +134,25 @@ def _section(label, table, required_cols):
                 st.success(f"Inserted {len(df_to_commit)} rows into **{table}**.")
     st.divider()
 
-
 # ---------- PAGE ENTRY POINT ----------
 def page() -> None:
     st.title("⬆️ Bulk Uploads")
 
+    # Inventory: item_name, item_barcode (optional), category, unit, initial_stock, current_stock
     _section(
         "Inventory Items",
         "inventory",
         ["item_name", "item_barcode", "category", "unit", "initial_stock", "current_stock"],
     )
 
+    # Purchases: bill_type, purchase_date, item_name, item_barcode, quantity, purchase_price
     _section(
         "Daily Purchases",
         "purchases",
         ["bill_type", "purchase_date", "item_name", "item_barcode", "quantity", "purchase_price"],
     )
 
+    # Sales: bill_type, sale_date, item_name, item_barcode, quantity, sale_price
     _section(
         "Daily Sales",
         "sales",
