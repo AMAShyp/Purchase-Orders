@@ -1,18 +1,22 @@
 """
-upload_handler.py – v5
+upload_handler.py – v6 (performance)
 • Validates columns
 • Normalises date columns
 • Maps item_name / item_barcode → item_id
 • Auto-adds new items (on Purchase Invoice only)
+• FAST bulk insert via psycopg2.extras.execute_values (batched)
+• FAST stock updates via one set-based UPDATE ... FROM (VALUES ...)
 • Updates current_stock using bill_type:
     - Purchases:  Purchase Invoice  (+), Purchase Return Invoice (−)
     - Sales:      Sales Invoice     (−), Sales Return Invoice     (+)
 """
 
 from __future__ import annotations
+import math
 import pandas as pd
-from typing import Literal
+from typing import Iterable, List, Literal, Sequence, Tuple
 from sqlalchemy import text
+from psycopg2.extras import execute_values
 from db_handler import fetch_dataframe, run_transaction
 
 # ───────────────────────── Column rules ──────────────────────────────── #
@@ -20,7 +24,7 @@ BASE_REQ = {
     "inventory": {"item_name", "item_barcode", "category", "unit",
                   "initial_stock", "current_stock"},
     "purchases": {"bill_type", "quantity", "purchase_price"},
-    "sales":     {"bill_type", "quantity", "sale_price"},
+    "sales":     {"bill_type", "sale_price", "quantity"},
 }
 
 DATE_COLS = {
@@ -65,21 +69,70 @@ def _row_sign(table: str, bill_type: str) -> int:
     base = 1 if table == "purchases" else -1
     return -base if is_return else base
 
+# ───────────────────────── Bulk helpers (fast) ──────────────────────── #
+def _dbapi(conn):
+    """Get DBAPI connection from SQLAlchemy Connection in 1.4/2.x."""
+    # Works on SQLAlchemy 1.4/2.x
+    try:
+        return conn.connection.dbapi_connection
+    except AttributeError:
+        try:
+            return conn.connection.connection
+        except AttributeError:
+            return conn.connection  # last resort
+
+def _iter_rows(df: pd.DataFrame, cols: Sequence[str]) -> Iterable[Tuple]:
+    # Ensure None for nulls; tuples for execute_values
+    for row in df[cols].itertuples(index=False, name=None):
+        yield tuple(None if (isinstance(v, float) and pd.isna(v)) or v is pd.NA else v for v in row)
+
+def _bulk_insert_values(conn, table: str, df: pd.DataFrame, chunk: int = 1000) -> None:
+    if df.empty:
+        return
+    cols: List[str] = list(df.columns)
+    dbapi_conn = _dbapi(conn)
+    sql = f"INSERT INTO {table} ({', '.join(cols)}) VALUES %s"
+    it = _iter_rows(df, cols)
+
+    with dbapi_conn.cursor() as cur:
+        while True:
+            batch = list(next_batch := tuple([x for _, x in zip(range(chunk), it)]))
+            if not batch:
+                break
+            execute_values(cur, sql, batch, page_size=chunk)
+
+def _bulk_update_deltas(conn, deltas: pd.Series) -> None:
+    """Apply stock deltas in one statement using VALUES list."""
+    values = [(int(k), int(v)) for k, v in deltas.items() if int(v) != 0]
+    if not values:
+        return
+    dbapi_conn = _dbapi(conn)
+    sql = (
+        "UPDATE inventory AS i "
+        "SET current_stock = i.current_stock + v.delta "
+        "FROM (VALUES %s) AS v(item_id, delta) "
+        "WHERE i.item_id = v.item_id"
+    )
+    with dbapi_conn.cursor() as cur:
+        execute_values(cur, sql, values, template="(%s, %s)", page_size=1000)
+
 # ───────────────────────── Main upsert function ─────────────────────── #
 @run_transaction
 def upsert_dataframe(conn,
                      df: pd.DataFrame,
                      table: Literal["inventory", "purchases", "sales"]) -> None:
+    # Drop fully-empty rows early
     df = df.dropna(how="all")
     if df.empty:
         raise ValueError("No data rows found.")
 
+    # Normalise dates for sales/purchases
     df = _normalise_dates(df, table)
 
     if table in ("purchases", "sales"):
         df = _handle_purchases_or_sales(conn, df, table)
     else:
-        _insert_dataframe(conn, df, "inventory")
+        _bulk_insert_values(conn, "inventory", df)
 
 # ───────────────────────── Purchases / Sales logic ──────────────────── #
 def _handle_purchases_or_sales(conn, df: pd.DataFrame, table: str) -> pd.DataFrame:
@@ -128,32 +181,20 @@ def _handle_purchases_or_sales(conn, df: pd.DataFrame, table: str) -> pd.DataFra
 
         df.at[idx, "item_id"] = item_id
 
-    # Compute deltas before dropping helper columns
+    # Compute deltas
     df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0).astype(int)
     df["_delta"] = df["quantity"] * df["__sign"]
 
-    # Insert rows (drop helper columns)
+    # Insert rows (drop helper columns) – bulk & batched
     drop_cols = [c for c in ("item_name", "item_barcode", "__sign", "_delta") if c in df.columns]
-    _insert_dataframe(conn, df.drop(columns=drop_cols), table)
+    _bulk_insert_values(conn, table, df.drop(columns=drop_cols))
 
-    # Aggregate and adjust stock
+    # Aggregate and apply stock deltas as one statement
     deltas = df.groupby("item_id")["_delta"].sum()
-    for item_id, delta in deltas.items():
-        # Avoid double-adding the first purchase qty for brand-new items
-        if table == "purchases" and item_id in inserted_qty:
-            delta -= inserted_qty[item_id]
-        if delta == 0:
-            continue
-        conn.execute(
-            text("UPDATE inventory SET current_stock = current_stock + :d WHERE item_id = :i;"),
-            {"d": int(delta), "i": int(item_id)},
-        )
+    # Avoid double-adding the first purchase qty for brand-new items
+    for item_id, qty in inserted_qty.items():
+        if item_id in deltas.index:
+            deltas.loc[item_id] = int(deltas.loc[item_id]) - int(qty)
+    deltas = deltas[deltas != 0]
+    _bulk_update_deltas(conn, deltas)
     return df
-
-# ───────────────────────── Generic INSERT helper ────────────────────── #
-def _insert_dataframe(conn, df: pd.DataFrame, table: str) -> None:
-    cols = list(df.columns)
-    placeholders = ", ".join([f":{c}" for c in cols])
-    sql = text(f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders});")
-    payload = df.where(pd.notnull(df), None).to_dict(orient="records")
-    conn.execute(sql, payload)
