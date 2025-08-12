@@ -1,4 +1,5 @@
-# upload.py – FAST v1 (minimal checks, COPY-based bulk insert)
+# upload.py – FAST v1.1 (headers-match-only COPY bulk insert)
+
 import time
 from io import StringIO, BytesIO
 from typing import List
@@ -6,22 +7,23 @@ from typing import List
 import pandas as pd
 import streamlit as st
 
-# relative imports with fallback (package vs flat)
+# Relative imports with fallback
 try:
     from .upload_handler import bulk_insert_exact_headers, get_row_count
 except Exception:
     from upload_handler import bulk_insert_exact_headers, get_row_count
 
 
-# ───────────────────────── file I/O ───────────────────────── #
-
 def _read_file(file) -> pd.DataFrame:
     """Read CSV or Excel, no value checks; just load to DataFrame."""
     t0 = time.perf_counter()
     if file.type == "text/csv":
-        df = pd.read_csv(StringIO(file.getvalue().decode("utf-8")), dtype_backend="pyarrow")
+        # Try pyarrow backend if available; fall back if not.
+        try:
+            df = pd.read_csv(StringIO(file.getvalue().decode("utf-8")), dtype_backend="pyarrow")
+        except TypeError:
+            df = pd.read_csv(StringIO(file.getvalue().decode("utf-8")))
     else:
-        # Excel → pandas → DataFrame; fast enough; user can upload CSV for even faster loads.
         df = pd.read_excel(BytesIO(file.getvalue()))
     ms = (time.perf_counter() - t0) * 1000
     st.caption(f"📥 File read in {ms:,.0f} ms")
@@ -29,14 +31,11 @@ def _read_file(file) -> pd.DataFrame:
 
 
 def _make_template(columns: List[str]) -> bytes:
-    """Tiny helper for convenience (optional)."""
     buf = BytesIO()
     pd.DataFrame(columns=columns).to_excel(buf, index=False, engine="openpyxl")
     buf.seek(0)
     return buf.read()
 
-
-# ───────────────────────── UI ───────────────────────── #
 
 TABLES = {
     "Inventory": "inventory",
@@ -75,6 +74,7 @@ def _section(label: str, table: str, template_cols: List[str]):
         st.info(f"🔎 Before insert → `{table}` rows: {before:,}")
     except Exception as e:
         st.warning(f"Pre-insert row count failed: {e}")
+        before = None
 
     # Read file
     df = _read_file(file)
@@ -105,8 +105,11 @@ def _section(label: str, table: str, template_cols: List[str]):
 
                 try:
                     after = get_row_count(table)
-                    st.info(f"📊 After insert → `{table}` rows: {after:,} "
-                            f"(+{after - before:,} new)")
+                    if before is not None:
+                        st.info(f"📊 After insert → `{table}` rows: {after:,} "
+                                f"(+{after - before:,} new)")
+                    else:
+                        st.info(f"📊 After insert → `{table}` rows: {after:,}")
                 except Exception as e:
                     st.warning(f"Post-insert row count failed: {e}")
 
@@ -121,13 +124,21 @@ def page():
     st.title("⚡ Bulk Upload (Headers‑Match Only)")
     st.caption("Fast path: as long as your file headers match the DB table, rows are inserted as-is. No extra checks.")
 
-    # If you want to show all three:
-    _section("Inventory Items", TABLES["Inventory"],
-             ["item_id","item_name","item_barcode","category","initial_stock","current_stock","unit","created_at","updated_at"])
-    _section("Daily Purchases", TABLES["Purchases"],
-             ["purchase_id","bill_type","purchase_date","item_id","item_name","item_barcode","quantity","purchase_price"])
-    _section("Daily Sales", TABLES["Sales"],
-             ["sale_id","bill_type","sale_date","item_id","item_name","item_barcode","quantity","sale_price"])
+    _section(
+        "Inventory Items",
+        TABLES["Inventory"],
+        ["item_id","item_name","item_barcode","category","initial_stock","current_stock","unit","created_at","updated_at"],
+    )
+    _section(
+        "Daily Purchases",
+        TABLES["Purchases"],
+        ["purchase_id","bill_type","purchase_date","item_id","item_name","item_barcode","quantity","purchase_price"],
+    )
+    _section(
+        "Daily Sales",
+        TABLES["Sales"],
+        ["sale_id","bill_type","sale_date","item_id","item_name","item_barcode","quantity","sale_price"],
+    )
 
 
 if __name__ == "__main__":
