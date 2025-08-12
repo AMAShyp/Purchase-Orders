@@ -1,9 +1,10 @@
-# page_uploads.py
-# Streamlit UI for bulk uploads (inventory, purchases, sales) with granular debug
+# upload.py – Streamlit bulk upload UI (final)
+# Shows granular debug steps before/during/after DB commit
+
 import streamlit as st
 import pandas as pd
 from io import StringIO, BytesIO
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional
 
 from upload_handler import (
     upsert_dataframe,
