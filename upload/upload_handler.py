@@ -1,16 +1,14 @@
-# upload_handler.py – v6 (final)
-# • Validates columns
-# • Normalises date columns
-# • Maps item_name / item_barcode → item_id
-# • Auto-adds new items (on Purchase Invoice only) with ON CONFLICT safety
-# • Updates current_stock using bill_type (atomic aggregated UPDATE)
-# • Verbose debug logs before/during/after inserts (DebugSink)
-
+# upload_handler.py – v6 (final, with robust imports)
 from __future__ import annotations
 import pandas as pd
 from typing import Literal, Optional, Dict, List
 from sqlalchemy import text
-from db_handler import fetch_dataframe, run_transaction
+
+# Robust import for db_handler (works whether run as a package or flat script)
+try:
+    from ..db_handler import fetch_dataframe, run_transaction  # if upload/ is a package inside a project
+except Exception:
+    from db_handler import fetch_dataframe, run_transaction     # if db_handler.py is on PYTHONPATH
 
 # ───────────────────────── Column rules ──────────────────────────────── #
 BASE_REQ = {
@@ -139,13 +137,11 @@ def upsert_dataframe(conn,
 
 # ───────────────────────── Purchases / Sales logic ──────────────────── #
 def _handle_purchases_or_sales(conn, df: pd.DataFrame, table: str, dbg: DebugSink) -> None:
-    # Load only names/codes we need to resolve (faster than scanning whole table)
     need_names = set(df["item_name"].dropna().astype(str).str.strip()) if "item_name" in df.columns else set()
     need_codes = set(df["item_barcode"].dropna().astype(str).str.strip()) if "item_barcode" in df.columns else set()
 
     dbg.log(f"[resolve] Need mapping for {len(need_names)} names, {len(need_codes)} barcodes.")
 
-    # Try param form; if the app's fetch_dataframe doesn't support params, fall back.
     inv = pd.DataFrame()
     try:
         inv = fetch_dataframe(
@@ -160,7 +156,6 @@ def _handle_purchases_or_sales(conn, df: pd.DataFrame, table: str, dbg: DebugSin
     name2id: Dict[str, int] = {}
     code2id: Dict[str, int] = {}
     if not inv.empty:
-        # Note: if duplicates exist, last one wins (OK for lookup)
         name2id = inv.set_index("item_name")["item_id"].to_dict()
         code2id = inv.set_index("item_barcode")["item_id"].to_dict()
 
@@ -168,7 +163,6 @@ def _handle_purchases_or_sales(conn, df: pd.DataFrame, table: str, dbg: DebugSin
 
     inserted_qty: Dict[int, int] = {}
 
-    # Resolve item_id + compute sign
     for idx, row in df.iterrows():
         sign = _row_sign(table, row.get("bill_type"))
         df.at[idx, "__sign"] = sign
@@ -185,14 +179,10 @@ def _handle_purchases_or_sales(conn, df: pd.DataFrame, table: str, dbg: DebugSin
         if nm and nm in name2id:
             candidate = name2id[nm]
         if bc and bc in code2id:
-            # If both present but point to different IDs, error out
             if candidate is not None and code2id[bc] != candidate:
-                raise ValueError(
-                    f"Row {idx}: item_name and item_barcode map to different items."
-                )
+                raise ValueError(f"Row {idx}: item_name and item_barcode map to different items.")
             candidate = code2id[bc]
 
-        # New item handling
         if candidate is None:
             if table == "purchases" and sign > 0:
                 qty = int(pd.to_numeric(row["quantity"], errors="coerce"))
@@ -214,20 +204,17 @@ def _handle_purchases_or_sales(conn, df: pd.DataFrame, table: str, dbg: DebugSin
                     "qty":  qty
                 }).scalar_one()
                 inserted_qty[int(item_id_new)] = qty
-                # Update maps so the rest of the file can reference it
                 if nm: name2id[nm] = int(item_id_new)
                 if bc: code2id[bc] = int(item_id_new)
                 df.at[idx, "item_id"] = int(item_id_new)
                 dbg.log(f"[new-item] Row {idx}: created item_id={item_id_new} (qty={qty}).")
             else:
-                # Unknown item on Sales OR on Purchase Return
                 raise ValueError(
                     f"Row {idx}: unknown item for {table} with bill_type='{row.get('bill_type')}'."
                 )
         else:
             df.at[idx, "item_id"] = int(candidate)
 
-    # Coerce numerics
     df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0).astype(int)
     if (df["quantity"] < 0).any():
         bad = df.index[df["quantity"] < 0].tolist()
@@ -237,23 +224,18 @@ def _handle_purchases_or_sales(conn, df: pd.DataFrame, table: str, dbg: DebugSin
     if price_col in df.columns:
         df[price_col] = pd.to_numeric(df[price_col], errors="coerce")
 
-    # Compute deltas before dropping helper columns
     df["_delta"] = df["quantity"] * df["__sign"]
 
-    # Insert rows to purchases/sales (drop helper columns not in target table)
     drop_cols = [c for c in ("item_name", "item_barcode", "__sign", "_delta") if c in df.columns]
     to_insert = df.drop(columns=drop_cols).copy()
-    dbg.log(f"[insert] Preparing to insert {to_insert.shape[0]} rows into '{table}'. "
-            f"Columns: {list(to_insert.columns)}")
+    dbg.log(f"[insert] Preparing to insert {to_insert.shape[0]} rows into '{table}'. Columns: {list(to_insert.columns)}")
 
     inserted = _insert_dataframe(conn, to_insert, table, dbg)
     dbg.log(f"[insert] Inserted {inserted} rows into '{table}'.")
 
-    # Aggregate and adjust stock atomically
     deltas = df.groupby("item_id")["_delta"].sum().reset_index()
     dbg.log(f"[stock] Computed deltas for {len(deltas)} items. Sample: {deltas.head(5).to_dict(orient='records')}")
 
-    # Avoid double-adding the first purchase qty for brand-new items
     if table == "purchases" and inserted_qty:
         deltas["_delta"] = deltas.apply(
             lambda r: int(r["_delta"] - inserted_qty.get(int(r["item_id"]), 0)), axis=1
@@ -265,7 +247,6 @@ def _handle_purchases_or_sales(conn, df: pd.DataFrame, table: str, dbg: DebugSin
         dbg.log("[stock] No net stock change required.")
         return
 
-    # One atomic UPDATE using UNNEST of arrays
     upd_sql = text("""
         WITH changes AS (
             SELECT UNNEST(:ids::int[]) AS item_id, UNNEST(:ds::int[]) AS d
@@ -288,7 +269,6 @@ def _insert_dataframe(conn, df: pd.DataFrame, table: str, dbg: Optional[DebugSin
     placeholders = ", ".join([f":{c}" for c in cols])
     sql = text(f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders});")
 
-    # None for NaN
     payload = df.where(pd.notnull(df), None).to_dict(orient="records")
 
     if dbg:
