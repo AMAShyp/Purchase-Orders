@@ -1,15 +1,16 @@
-# upload_handler.py – FAST v1
-# Purpose: bulk insert if headers match DB table; no per-cell checks.
+# upload_handler.py – FAST v1.1
+# Purpose: bulk insert if headers match DB table; no cell-level checks.
+
 from __future__ import annotations
 
 import io
 import time
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Dict, Any, Optional
 
 import pandas as pd
 from sqlalchemy import text
 
-# robust imports whether used as package or flat
+# Robust imports whether used as package or flat
 try:
     from ..db_handler import fetch_dataframe, run_transaction
 except Exception:
@@ -20,7 +21,7 @@ except Exception:
 
 def _get_table_columns_ordered(conn, table: str, schema: str = "public") -> List[str]:
     """
-    DB column order for COPY; excludes generated/identity defaults (COPY needs explicit list anyway).
+    Return DB column order for COPY (physical order from information_schema).
     """
     q = text("""
         SELECT column_name
@@ -33,54 +34,45 @@ def _get_table_columns_ordered(conn, table: str, schema: str = "public") -> List
 
 
 def _match_and_reorder_columns(df: pd.DataFrame, db_cols: List[str]) -> pd.DataFrame:
-    # Case-insensitive match, but we output exact DB names and order.
+    """
+    Case-insensitive header match against DB; disallow extras; no missing.
+    Reorder to DB order and return a DataFrame whose columns exactly equal db_cols.
+    """
     map_lower_to_db = {c.lower(): c for c in db_cols}
     df_lower = [c.lower() for c in df.columns]
 
-    # exact set equality required (no extras, no missing)
     if set(df_lower) != set(map_lower_to_db.keys()):
         missing = [c for c in db_cols if c.lower() not in df_lower]
         extra = [c for c in df.columns if c.lower() not in map_lower_to_db]
         raise ValueError(
-            f"Header mismatch. Missing in file: {missing or '[]'}; "
-            f"Extra in file: {extra or '[]'}.\n"
+            "Header mismatch.\n"
+            f"Missing in file: {missing or '[]'}\n"
+            f"Extra in file:   {extra or '[]'}\n"
             f"Expected columns (order irrelevant): {db_cols}"
         )
 
-    # reorder to DB order and rename to exact DB casing
-    ordered = [map_lower_to_db[c.lower()] for c in df.columns]  # file order with DB casing
-    # Now reorder strictly to DB physical order:
-    df = df.rename(columns={c: c for c in df.columns})  # no-op; clarity
-    # rebuild dataframe in DB order using mapping
-    proj = [map_lower_to_db[c.lower()] for c in db_cols]
+    # Rename to exact DB casing, then project in DB order
     rename_map = {c: map_lower_to_db[c.lower()] for c in df.columns}
     df2 = df.rename(columns=rename_map)
-    return df2[proj]
+    return df2[db_cols]
 
 
 def _get_raw_psycopg2_connection(sqlalchemy_conn) -> Optional[Any]:
     """
     Best-effort unwrap to psycopg2 connection for COPY.
-    Supports SQLAlchemy 1.x and 2.x typical stacks.
     """
     raw = getattr(sqlalchemy_conn, "connection", None)
     if raw is None:
         return None
-    # SQLAlchemy Connection -> DBAPI connection (psycopg2)
-    # sqlalchemy_conn.connection is a ConnectionFairy in old versions; .connection again gives raw
     psyco = getattr(raw, "connection", raw)
-    # Check if psycopg2-like (has cursor() and copy_expert via cursor)
-    if hasattr(psyco, "cursor"):
-        return psyco
-    return None
+    return psyco if hasattr(psyco, "cursor") else None
 
 
 def _to_csv_buffer(df: pd.DataFrame) -> io.StringIO:
     """
-    Convert DF to CSV for COPY. Use \N as NULL marker (fast, avoids quoting hell).
+    Convert DF to CSV for COPY. Use \\N as NULL marker.
     """
     buf = io.StringIO()
-    # header=False (we supply column list to COPY), na_rep='\\N' emits literal \N
     df.to_csv(buf, index=False, header=False, na_rep='\\N')
     buf.seek(0)
     return buf
@@ -94,19 +86,19 @@ def bulk_insert_exact_headers(conn, df: pd.DataFrame, table: str, schema: str = 
     Ultra-fast bulk insert:
       1) Read DB columns (ordered)
       2) Require exact header match (case-insensitive); reorder to DB order
-      3) COPY FROM STDIN CSV with NULL '\N'
-    If COPY unavailable, fallback to executemany INSERT.
+      3) COPY FROM STDIN CSV with NULL '\\N'
+    Fallback: executemany INSERT if COPY unavailable.
     Returns timing info.
     """
     timings: Dict[str, float] = {}
     t0 = time.perf_counter()
 
-    # 1) table columns (ordered)
+    # Columns
     t = time.perf_counter()
     db_cols = _get_table_columns_ordered(conn, table, schema)
     timings["fetch_columns_ms"] = (time.perf_counter() - t) * 1000
 
-    # 2) align columns (no per-cell checks)
+    # Align
     t = time.perf_counter()
     df = df.dropna(how="all")
     if df.empty:
@@ -114,11 +106,11 @@ def bulk_insert_exact_headers(conn, df: pd.DataFrame, table: str, schema: str = 
     df_aligned = _match_and_reorder_columns(df, db_cols)
     timings["align_columns_ms"] = (time.perf_counter() - t) * 1000
 
-    # 3) COPY (fast path)
-    t = time.perf_counter()
-    raw = _get_raw_psycopg2_connection(conn)
+    # COPY fast path
     rows = len(df_aligned)
     used_copy = False
+    t = time.perf_counter()
+    raw = _get_raw_psycopg2_connection(conn)
     if raw is not None:
         csv_buf = _to_csv_buffer(df_aligned)
         col_list = ", ".join(f'"{c}"' for c in db_cols)
@@ -131,13 +123,13 @@ def bulk_insert_exact_headers(conn, df: pd.DataFrame, table: str, schema: str = 
             cur.close()
     timings["copy_or_insert_ms"] = (time.perf_counter() - t) * 1000
 
-    # Fallback if COPY not used
+    # Fallback executemany
     if not used_copy:
         t = time.perf_counter()
         placeholders = ", ".join([f":{c}" for c in db_cols])
         ins = text(f'INSERT INTO "{schema}"."{table}" ({", ".join(db_cols)}) VALUES ({placeholders})')
         payload = df_aligned.where(pd.notnull(df_aligned), None).to_dict(orient="records")
-        conn.execute(ins, payload)  # executemany
+        conn.execute(ins, payload)
         timings["executemany_ms"] = (time.perf_counter() - t) * 1000
 
     timings["total_ms"] = (time.perf_counter() - t0) * 1000
@@ -145,6 +137,16 @@ def bulk_insert_exact_headers(conn, df: pd.DataFrame, table: str, schema: str = 
 
 
 def get_row_count(table: str, schema: str = "public") -> int:
-    q = text(f'SELECT COUNT(*) FROM "{schema}"."{table}"')
+    q = f'SELECT COUNT(*) FROM "{schema}"."{table}"'
     df = fetch_dataframe(q)
     return int(df.iloc[0, 0])
+
+
+# ─────────── Back-compat alias (your __init__.py imports this) ───────── #
+# Make your existing `from .upload_handler import upsert_dataframe` work.
+def upsert_dataframe(*, df: pd.DataFrame, table: str, **kwargs) -> Dict[str, Any]:
+    """
+    Compatibility wrapper -> calls bulk_insert_exact_headers.
+    """
+    # run_transaction wrapper expects a connection first; our bulk_* already wrapped.
+    return bulk_insert_exact_headers(df=df, table=table)
