@@ -7,6 +7,7 @@ from db_handler import fetch_dataframe
 MAX_NAME_LEN = 255
 MAX_BARCODE_LEN = 128
 
+# ---------- file I/O ----------
 def _read_file(file):
     if file.type == "text/csv":
         return pd.read_csv(StringIO(file.getvalue().decode("utf-8")))
@@ -18,6 +19,7 @@ def _make_template(columns):
     buf.seek(0)
     return buf.read()
 
+# ---------- normalizers ----------
 def _normalize_name(series: pd.Series) -> pd.Series:
     return series.fillna("").astype(str).str.strip().str.casefold()
 
@@ -25,6 +27,7 @@ def _normalize_barcode(series: pd.Series) -> pd.Series:
     s = series.fillna("").astype(str).str.strip()
     return s.str.replace(r"\.0$", "", regex=True)
 
+# ---------- preview: make Arrow-friendly ----------
 def _arrow_friendly_preview(df: pd.DataFrame, table: str) -> pd.DataFrame:
     preview = df.copy()
     text_cols = {
@@ -38,6 +41,7 @@ def _arrow_friendly_preview(df: pd.DataFrame, table: str) -> pd.DataFrame:
             preview[col] = preview[col].replace({"nan": ""})
     return preview
 
+# ---------- inventory duplicate policy ----------
 def _filter_inventory_conflicts(df: pd.DataFrame):
     name_norm = _normalize_name(df["item_name"])
     code_norm = _normalize_barcode(df.get("item_barcode", ""))
@@ -66,6 +70,7 @@ def _filter_inventory_conflicts(df: pd.DataFrame):
     filtered = df[~both_dup_mask].copy()
     return filtered, skipped
 
+# ---------- length guard ----------
 def _validate_inventory_lengths(df: pd.DataFrame):
     name = df["item_name"].fillna("").astype(str)
     code = _normalize_barcode(df.get("item_barcode", pd.Series([], dtype="object")))
@@ -93,6 +98,7 @@ def _validate_inventory_lengths(df: pd.DataFrame):
 
     return False, df
 
+# ---------- section ----------
 def _section(label, table, required_cols):
     st.subheader(label)
     st.download_button(
@@ -115,21 +121,20 @@ def _section(label, table, required_cols):
 
     df = _read_file(file)
     st.info(f"Loaded file with {df.shape[0]} rows and {df.shape[1]} columns.")
-    st.write("Preview:")
     st.dataframe(_arrow_friendly_preview(df, table), use_container_width=True, height=300)
 
     try:
         check_columns(df, table)
         valid = True
-        st.success("Column check passed.")
+        st.success("✅ Column check passed.")
     except ValueError as e:
-        st.error(f"Column check failed: {e}")
+        st.error(f"❌ Column check failed: {e}")
         valid = False
 
     df_to_commit = df
     if valid and table == "inventory":
         if (df["item_name"].astype(str).str.strip() == "").any() or df["item_name"].isna().any():
-            st.error("All inventory rows must have a non-empty item_name. Barcode can be blank.")
+            st.error("❌ All inventory rows must have a non-empty item_name. Barcode can be blank.")
             valid = False
         else:
             valid, df_lenfixed = _validate_inventory_lengths(df)
@@ -138,10 +143,10 @@ def _section(label, table, required_cols):
                 filtered, skipped = _filter_inventory_conflicts(df_lenfixed)
                 st.info(f"After duplicate filtering: {filtered.shape[0]} rows to insert, {skipped.shape[0]} skipped.")
                 if not skipped.empty:
-                    st.warning("Skipped rows due to both name & barcode duplicate.")
+                    st.warning("⚠️ Skipped rows due to both name & barcode duplicate.")
                     st.dataframe(_arrow_friendly_preview(skipped, "inventory"), use_container_width=True, height=200)
                 if filtered.empty:
-                    st.error("No rows left to insert after filtering.")
+                    st.error("❌ No rows left to insert after filtering.")
                     valid = False
                 else:
                     filtered = filtered.copy()
@@ -153,14 +158,30 @@ def _section(label, table, required_cols):
                     df_to_commit = filtered
 
     if st.button("✅ Commit to DB", key=f"commit_{table}", disabled=not valid):
-        with st.spinner("Inserting rows …"):
+        with st.spinner("Inserting rows into DB…"):
             try:
                 upsert_dataframe(df=df_to_commit, table=table)
-                st.success(f"Inserted {len(df_to_commit)} rows into **{table}**.")
+                st.success(f"✅ Inserted {len(df_to_commit)} rows into **{table}**.")
+
+                # --- Debug after commit ---
+                try:
+                    count_df = fetch_dataframe(f"SELECT COUNT(*) AS total FROM {table};")
+                    st.info(f"📊 Table `{table}` now has {int(count_df['total'].iloc[0])} total rows.")
+                    st.write("Here are the last 5 rows in the table:")
+                    last_rows = fetch_dataframe(
+                        f"SELECT * FROM {table} ORDER BY item_id DESC LIMIT 5;"
+                        if table == "inventory"
+                        else f"SELECT * FROM {table} ORDER BY 1 DESC LIMIT 5;"
+                    )
+                    st.dataframe(last_rows, use_container_width=True)
+                except Exception as dbg_err:
+                    st.warning(f"Post-insert debug query failed: {dbg_err}")
+
             except Exception as exc:
-                st.error(f"Upload failed → {exc}")
+                st.error(f"❌ Upload failed → {exc}")
     st.divider()
 
+# ---------- PAGE ENTRY POINT ----------
 def page():
     st.title("⬆️ Bulk Uploads")
     _section(
