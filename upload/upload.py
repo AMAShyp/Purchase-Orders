@@ -4,6 +4,9 @@ from io import StringIO, BytesIO
 from .upload_handler import upsert_dataframe, check_columns
 from db_handler import fetch_dataframe  # for DB duplicate checks
 
+# ---------- config for length caps ----------
+MAX_NAME_LEN = 255
+MAX_BARCODE_LEN = 128
 
 # ---------- file I/O ----------
 def _read_file(file):
@@ -17,7 +20,6 @@ def _make_template(columns):
     buf.seek(0)
     return buf.read()
 
-
 # ---------- normalizers ----------
 def _normalize_name(series: pd.Series) -> pd.Series:
     return series.fillna("").astype(str).str.strip().str.casefold()
@@ -26,10 +28,8 @@ def _normalize_barcode(series: pd.Series) -> pd.Series:
     s = series.fillna("").astype(str).str.strip()
     return s.str.replace(r"\.0$", "", regex=True)
 
-
 # ---------- preview: make Arrow-friendly without touching original df ----------
 def _arrow_friendly_preview(df: pd.DataFrame, table: str) -> pd.DataFrame:
-    """Coerce likely text columns to strings so Streamlit/Arrow can render safely."""
     preview = df.copy()
     text_cols = {
         "inventory": ["item_name", "item_barcode", "category", "unit"],
@@ -39,10 +39,8 @@ def _arrow_friendly_preview(df: pd.DataFrame, table: str) -> pd.DataFrame:
     for col in text_cols:
         if col in preview.columns:
             preview[col] = preview[col].astype(str).where(preview[col].notna(), "")
-            # avoid literal 'nan'
             preview[col] = preview[col].replace({"nan": ""})
     return preview
-
 
 # ---------- inventory duplicate policy ----------
 def _filter_inventory_conflicts(df: pd.DataFrame):
@@ -82,6 +80,39 @@ def _filter_inventory_conflicts(df: pd.DataFrame):
     filtered = dfc[~both_dup_mask].copy()
     return filtered, skipped
 
+# ---------- length guard ----------
+def _validate_inventory_lengths(df: pd.DataFrame):
+    """Block rows with over-long name/barcode; return (ok, df_fixed)."""
+    name = df["item_name"].fillna("").astype(str)
+    code = _normalize_barcode(df.get("item_barcode", pd.Series([], dtype="object")))
+
+    too_long = (name.str.len() > MAX_NAME_LEN) | (code.str.len() > MAX_BARCODE_LEN)
+
+    if not too_long.any():
+        return True, df
+
+    st.error(
+        f"Some rows exceed length limits (item_name ≤ {MAX_NAME_LEN}, "
+        f"item_barcode ≤ {MAX_BARCODE_LEN})."
+    )
+    show = df.loc[too_long].copy()
+    show["item_name_len"] = name[too_long].str.len().values
+    show["item_barcode_len"] = code[too_long].str.len().values
+    st.dataframe(_arrow_friendly_preview(show, "inventory"),
+                 use_container_width=True, height=220)
+
+    if st.checkbox("✂️ Auto-truncate long values and continue (not recommended)"):
+        df2 = df.copy()
+        df2["item_name"] = name.str.slice(0, MAX_NAME_LEN)
+        # Truncate barcode safely (normalized view)
+        code2 = code.str.slice(0, MAX_BARCODE_LEN)
+        # Replace empty-string barcodes with NA (store as NULL)
+        code2 = code2.mask(code2.str.strip() == "", pd.NA)
+        df2["item_barcode"] = code2
+        st.info("Values truncated to fit limits.")
+        return True, df2
+
+    return False, df
 
 # ---------- section ----------
 def _section(label, table, required_cols):
@@ -125,7 +156,7 @@ def _section(label, table, required_cols):
         st.error(str(e))
         valid = False
 
-    # Inventory-specific duplicate filtering
+    # Inventory-specific rules
     df_to_commit = df
     if valid and table == "inventory":
         # Require non-empty item_name; barcode may be blank
@@ -133,21 +164,33 @@ def _section(label, table, required_cols):
             st.error("All inventory rows must have a non-empty item_name. Barcode can be blank.")
             valid = False
         else:
-            filtered, skipped = _filter_inventory_conflicts(df)
-            if len(skipped) > 0:
-                st.warning(
-                    f"Skipping {len(skipped)} row(s) where BOTH item_name and item_barcode "
-                    "duplicate existing data. Rows with empty barcode or a single-field "
-                    "duplicate are allowed."
-                )
-                with st.expander("Show skipped rows"):
-                    st.dataframe(_arrow_friendly_preview(skipped, "inventory"),
-                                 use_container_width=True, height=220)
-            if filtered.empty:
-                st.info("After skipping conflicting rows, there is nothing to insert.")
-                valid = False
-            else:
-                df_to_commit = filtered
+            # Length guard
+            valid, df_lenfixed = _validate_inventory_lengths(df)
+            if valid:
+                # Duplicate policy (skip only when both duplicated and barcode non-empty)
+                filtered, skipped = _filter_inventory_conflicts(df_lenfixed)
+                if len(skipped) > 0:
+                    st.warning(
+                        f"Skipping {len(skipped)} row(s) where BOTH item_name and item_barcode "
+                        "duplicate existing data. Rows with empty barcode or a single-field "
+                        "duplicate are allowed."
+                    )
+                    with st.expander("Show skipped rows"):
+                        st.dataframe(_arrow_friendly_preview(skipped, "inventory"),
+                                     use_container_width=True, height=220)
+
+                if filtered.empty:
+                    st.info("After skipping conflicting rows, there is nothing to insert.")
+                    valid = False
+                else:
+                    # Final sanitation before commit:
+                    # - normalize barcode text
+                    # - empty/whitespace barcode -> NA (stored as NULL)
+                    filtered = filtered.copy()
+                    if "item_barcode" in filtered.columns:
+                        bc = _normalize_barcode(filtered["item_barcode"])
+                        filtered["item_barcode"] = bc.mask(bc.str.strip() == "", pd.NA)
+                    df_to_commit = filtered
 
     if st.button("✅ Commit to DB", key=f"commit_{table}", disabled=not valid):
         with st.spinner("Inserting rows …"):
@@ -159,23 +202,25 @@ def _section(label, table, required_cols):
                 st.success(f"Inserted {len(df_to_commit)} rows into **{table}**.")
     st.divider()
 
-
 # ---------- PAGE ENTRY POINT ----------
 def page() -> None:
     st.title("⬆️ Bulk Uploads")
 
+    # Inventory: item_name, item_barcode (optional), category, unit, initial_stock, current_stock
     _section(
         "Inventory Items",
         "inventory",
         ["item_name", "item_barcode", "category", "unit", "initial_stock", "current_stock"],
     )
 
+    # Purchases: bill_type, purchase_date, item_name, item_barcode, quantity, purchase_price
     _section(
         "Daily Purchases",
         "purchases",
         ["bill_type", "purchase_date", "item_name", "item_barcode", "quantity", "purchase_price"],
     )
 
+    # Sales: bill_type, sale_date, item_name, item_barcode, quantity, sale_price
     _section(
         "Daily Sales",
         "sales",
