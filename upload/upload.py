@@ -1,17 +1,20 @@
-# upload.py – Streamlit bulk upload UI (final)
-# Shows granular debug steps before/during/after DB commit
-
+# upload.py – Streamlit bulk upload UI (final, with relative import)
 import streamlit as st
 import pandas as pd
 from io import StringIO, BytesIO
 from typing import List, Tuple, Optional
 
-from upload_handler import (
-    upsert_dataframe,
-    check_columns,
-    DebugSink,
-)
-from db_handler import fetch_dataframe
+# Import from sibling upload_handler.py (relative), with fallback
+try:
+    from .upload_handler import upsert_dataframe, check_columns, DebugSink
+except Exception:
+    from upload_handler import upsert_dataframe, check_columns, DebugSink
+
+# db_handler normally lives one level up; keep it robust
+try:
+    from ..db_handler import fetch_dataframe
+except Exception:
+    from db_handler import fetch_dataframe
 
 MAX_NAME_LEN = 255
 MAX_BARCODE_LEN = 128
@@ -154,26 +157,22 @@ def _section(label: str, table: str, required_cols: List[str]):
         st.divider()
         return
 
-    # BEFORE: snapshot table count
     before = _pre_snapshot(table)
     if before is not None:
         st.info(f"🔎 Before insert → `{table}` rows: {int(before['c'].iloc[0])}")
 
-    # Load & preview
     df = _read_file(file)
     st.info(f"📥 Loaded file with {df.shape[0]} rows and {df.shape[1]} columns.")
     st.dataframe(_arrow_friendly_preview(df, table), use_container_width=True, height=300)
 
-    # Validate columns
     try:
-        check_columns(df, table)  # raises on error
+        check_columns(df, table)
         valid = True
         st.success("✅ Column check passed.")
     except ValueError as e:
         st.error(f"❌ Column check failed: {e}")
         valid = False
 
-    # Inventory-only extra checks
     df_to_commit = df
     if valid and table == "inventory":
         if (df["item_name"].astype(str).str.strip() == "").any() or df["item_name"].isna().any():
@@ -202,23 +201,19 @@ def _section(label: str, table: str, required_cols: List[str]):
                                  use_container_width=True, height=300)
                     df_to_commit = filtered
 
-    # Commit
     dbg = DebugSink()
     commit_btn = st.button("✅ Commit to DB", key=f"commit_{table}", disabled=not valid, type="primary")
     if commit_btn:
         with st.status("Running bulk insert…", expanded=True) as status:
             st.write("• Validating and normalising data…")
             try:
-                # Let the handler run everything inside one DB transaction
                 upsert_dataframe(df=df_to_commit, table=table, debug=dbg)
                 st.write("• Insert statements executed.")
                 status.update(label="Commit successful ✅", state="complete")
 
-                # AFTER: snapshot table count
                 after = _post_snapshot(table)
                 if after is not None:
                     st.info(f"📊 After insert → `{table}` rows: {int(after['c'].iloc[0])}")
-                # Show last 5 rows for quick sanity
                 try:
                     st.write("Here are the last 5 rows in the table:")
                     last_rows = fetch_dataframe(
@@ -233,7 +228,6 @@ def _section(label: str, table: str, required_cols: List[str]):
                 status.update(label="Commit failed ❌", state="error")
                 st.error(f"❌ Upload failed → {exc}")
 
-        # Always show detailed internal logs
         _show_debug("🪵 Detailed debug log (from transaction)", dbg.dump())
 
     st.divider()
