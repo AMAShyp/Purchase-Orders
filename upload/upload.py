@@ -1,4 +1,4 @@
-# upload.py – FAST v1.2 (subset headers + numeric coercion)
+# upload.py – FAST v1.3 (subset headers + numeric coercion; decorator-safe call)
 import time
 from io import StringIO, BytesIO
 from typing import List
@@ -6,6 +6,7 @@ from typing import List
 import pandas as pd
 import streamlit as st
 
+# Relative imports with fallback
 try:
     from .upload_handler import bulk_insert_exact_headers, get_row_count
 except Exception:
@@ -83,6 +84,7 @@ def _section(label: str, table: str, template_cols: List[str]):
         with st.status("Running bulk insert…", expanded=True) as status:
             try:
                 t0 = time.perf_counter()
+                # NOTE: call with keywords; decorator injects `conn` transparently
                 result = bulk_insert_exact_headers(df=df, table=table)
                 total_ms = (time.perf_counter() - t0) * 1000
 
@@ -131,7 +133,7 @@ def page():
         ["item_name","item_barcode","category","unit","initial_stock","current_stock"],
     )
 
-    # (Keep these if you also bulk load purchases/sales; otherwise remove)
+    # (Keep/remove purchases/sales sections as needed)
     _section(
         "Daily Purchases",
         TABLES["Purchases"],
