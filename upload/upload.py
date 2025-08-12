@@ -6,6 +6,7 @@ from db_handler import fetch_dataframe
 
 MAX_NAME_LEN = 255
 MAX_BARCODE_LEN = 128
+PREVIEW_ROWS = 200  # cap preview to speed up UI
 
 # ---------- file I/O ----------
 def _read_file(file):
@@ -29,7 +30,7 @@ def _normalize_barcode(series: pd.Series) -> pd.Series:
 
 # ---------- preview: make Arrow-friendly ----------
 def _arrow_friendly_preview(df: pd.DataFrame, table: str) -> pd.DataFrame:
-    preview = df.copy()
+    preview = df.head(PREVIEW_ROWS).copy()  # only first N rows
     text_cols = {
         "inventory": ["item_name", "item_barcode", "category", "unit"],
         "purchases": ["bill_type", "item_name", "item_barcode"],
@@ -121,7 +122,11 @@ def _section(label, table, required_cols):
 
     df = _read_file(file)
     st.info(f"Loaded file with {df.shape[0]} rows and {df.shape[1]} columns.")
+    st.write("Preview (first {PREVIEW_ROWS} rows):")
     st.dataframe(_arrow_friendly_preview(df, table), use_container_width=True, height=300)
+    with st.expander("Show full file (may be slow)"):
+        st.dataframe(_arrow_friendly_preview(df if len(df) <= 5000 else df.sample(5000), table),
+                     use_container_width=True, height=300)
 
     try:
         check_columns(df, table)
@@ -153,7 +158,7 @@ def _section(label, table, required_cols):
                     if "item_barcode" in filtered.columns:
                         bc = _normalize_barcode(filtered["item_barcode"])
                         filtered["item_barcode"] = bc.mask(bc.str.strip() == "", pd.NA)
-                    st.info("Final data to commit:")
+                    st.info("Final data to commit (first rows):")
                     st.dataframe(_arrow_friendly_preview(filtered, "inventory"), use_container_width=True, height=300)
                     df_to_commit = filtered
 
@@ -162,21 +167,17 @@ def _section(label, table, required_cols):
             try:
                 upsert_dataframe(df=df_to_commit, table=table)
                 st.success(f"✅ Inserted {len(df_to_commit)} rows into **{table}**.")
-
-                # --- Debug after commit ---
                 try:
                     count_df = fetch_dataframe(f"SELECT COUNT(*) AS total FROM {table};")
                     st.info(f"📊 Table `{table}` now has {int(count_df['total'].iloc[0])} total rows.")
-                    st.write("Here are the last 5 rows in the table:")
-                    last_rows = fetch_dataframe(
-                        f"SELECT * FROM {table} ORDER BY item_id DESC LIMIT 5;"
-                        if table == "inventory"
-                        else f"SELECT * FROM {table} ORDER BY 1 DESC LIMIT 5;"
-                    )
+                    if table == "inventory":
+                        last_rows = fetch_dataframe("SELECT * FROM inventory ORDER BY item_id DESC LIMIT 5;")
+                    else:
+                        last_rows = fetch_dataframe(f"SELECT * FROM {table} ORDER BY 1 DESC LIMIT 5;")
+                    st.write("Last few rows:")
                     st.dataframe(last_rows, use_container_width=True)
                 except Exception as dbg_err:
                     st.warning(f"Post-insert debug query failed: {dbg_err}")
-
             except Exception as exc:
                 st.error(f"❌ Upload failed → {exc}")
     st.divider()
