@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 from io import StringIO, BytesIO
 from .upload_handler import upsert_dataframe, check_columns
-from db_handler import fetch_dataframe  # ← to check against existing inventory
+from db_handler import fetch_dataframe  # to compare against existing inventory
 
 
 # ---------- helpers ----------
@@ -18,78 +18,50 @@ def _make_template(columns):
     return buf.read()
 
 def _normalize_name(series: pd.Series) -> pd.Series:
-    # lowercased, trimmed; empty -> ""
+    # lowercased, trimmed
     return series.fillna("").astype(str).str.strip().str.casefold()
 
 def _normalize_barcode(series: pd.Series) -> pd.Series:
-    # keep as text, strip spaces, drop trailing ".0" if Excel coerced numbers
+    # keep as text, strip spaces, drop trailing ".0" (Excel artifact)
     s = series.fillna("").astype(str).str.strip()
     return s.str.replace(r"\.0$", "", regex=True)
 
-def _validate_inventory_uniques(df: pd.DataFrame) -> bool:
+def _filter_inventory_conflicts(df: pd.DataFrame):
     """
-    Validate inventory upload:
-      - no missing item_name / item_barcode
-      - no duplicates within the file
-      - no duplicates vs existing DB inventory
-    Returns True if OK, else False (and renders errors in Streamlit).
+    Skip rows only when BOTH item_name AND item_barcode are duplicates
+    (either within the file OR already in the DB).
+    Return (filtered_df, skipped_df).
     """
-    ok = True
-    df_local = df.copy()
+    dfc = df.copy()
 
-    # Basic presence
-    name_norm = _normalize_name(df_local["item_name"])
-    code_norm = _normalize_barcode(df_local["item_barcode"])
+    # Normalised fields
+    name_norm = _normalize_name(dfc["item_name"])
+    code_norm = _normalize_barcode(dfc["item_barcode"])
 
-    missing_name_mask = name_norm.eq("")
-    missing_code_mask = code_norm.eq("")
+    # Duplicates within the uploaded file
+    dup_name_file = name_norm.map(name_norm.value_counts()).gt(1) & name_norm.ne("")
+    dup_code_file = code_norm.map(code_norm.value_counts()).gt(1) & code_norm.ne("")
 
-    if missing_name_mask.any():
-        st.error(f"Missing `item_name` in rows: {list(df_local.index[missing_name_mask])}")
-        st.dataframe(df_local[missing_name_mask], use_container_width=True, height=150)
-        ok = False
-
-    if missing_code_mask.any():
-        st.error(f"Missing `item_barcode` in rows: {list(df_local.index[missing_code_mask])}")
-        st.dataframe(df_local[missing_code_mask], use_container_width=True, height=150)
-        ok = False
-
-    # Duplicates within the file
-    dup_name_mask = name_norm.duplicated(keep=False) & name_norm.ne("")
-    if dup_name_mask.any():
-        st.error("Duplicate `item_name` found within the uploaded file.")
-        st.dataframe(df_local[dup_name_mask], use_container_width=True, height=200)
-        ok = False
-
-    dup_code_mask = code_norm.duplicated(keep=False) & code_norm.ne("")
-    if dup_code_mask.any():
-        st.error("Duplicate `item_barcode` found within the uploaded file.")
-        st.dataframe(df_local[dup_code_mask], use_container_width=True, height=200)
-        ok = False
-
-    # Conflicts against existing DB inventory
+    # Duplicates vs DB
     try:
         existing = fetch_dataframe("SELECT item_name, item_barcode FROM inventory;")
-        db_names = _normalize_name(existing["item_name"])
-        db_codes = _normalize_barcode(existing["item_barcode"])
-        name_conflict_mask = name_norm.isin(set(db_names)) & name_norm.ne("")
-        code_conflict_mask = code_norm.isin(set(db_codes)) & code_norm.ne("")
+        db_names = set(_normalize_name(existing["item_name"]))
+        db_codes = set(_normalize_barcode(existing["item_barcode"]))
+    except Exception:
+        # If DB check fails for any reason, treat as empty (best-effort)
+        db_names, db_codes = set(), set()
 
-        if name_conflict_mask.any():
-            st.error("These rows conflict with existing `item_name` values in inventory.")
-            st.dataframe(df_local[name_conflict_mask], use_container_width=True, height=200)
-            ok = False
+    dup_name_db = name_norm.isin(db_names) & name_norm.ne("")
+    dup_code_db = code_norm.isin(db_codes) & code_norm.ne("")
 
-        if code_conflict_mask.any():
-            st.error("These rows conflict with existing `item_barcode` values in inventory.")
-            st.dataframe(df_local[code_conflict_mask], use_container_width=True, height=200)
-            ok = False
+    # Row is a "both duplicate" if name is dup (file or DB) AND barcode is dup (file or DB)
+    name_dup_any = dup_name_file | dup_name_db
+    code_dup_any = dup_code_file | dup_code_db
+    both_dup_mask = name_dup_any & code_dup_any
 
-    except Exception as e:
-        # If DB is unreachable, don't hard-fail the page—just warn.
-        st.warning(f"Could not validate against existing inventory: {e}")
-
-    return ok
+    skipped = dfc[both_dup_mask]
+    filtered = dfc[~both_dup_mask].copy()
+    return filtered, skipped
 
 def _section(label, table, required_cols):
     st.subheader(label)
@@ -129,19 +101,36 @@ def _section(label, table, required_cols):
         st.error(str(e))
         valid = False
 
-    # Extra duplicate checks for INVENTORY uploads (in this page layer)
+    # For INVENTORY: skip rows only when BOTH fields are duplicates
+    df_to_commit = df
     if valid and table == "inventory":
-        if not _validate_inventory_uniques(df):
+        # Basic presence check (still required)
+        if df["item_name"].isna().any() or df["item_barcode"].isna().any():
+            st.error("All inventory rows must have both item_name and item_barcode.")
             valid = False
+        else:
+            filtered, skipped = _filter_inventory_conflicts(df)
+            if len(skipped) > 0:
+                st.warning(
+                    f"Skipping {len(skipped)} row(s) where BOTH item_name and item_barcode "
+                    "duplicate existing data. Rows with only one duplicate are allowed."
+                )
+                with st.expander("Show skipped rows"):
+                    st.dataframe(skipped, use_container_width=True, height=200)
+            if filtered.empty:
+                st.info("After skipping conflicting rows, there is nothing to insert.")
+                valid = False
+            else:
+                df_to_commit = filtered
 
     if st.button("✅ Commit to DB", key=f"commit_{table}", disabled=not valid):
         with st.spinner("Inserting rows …"):
             try:
-                upsert_dataframe(df=df, table=table)
+                upsert_dataframe(df=df_to_commit, table=table)
             except Exception as exc:
                 st.error(f"Upload failed → {exc}")
             else:
-                st.success(f"Inserted {len(df)} rows into **{table}**.")
+                st.success(f"Inserted {len(df_to_commit)} rows into **{table}**.")
     st.divider()
 
 # ---------- PAGE ENTRY POINT ----------
