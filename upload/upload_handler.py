@@ -1,8 +1,9 @@
 """
-upload_handler.py – v5
+upload_handler.py – v6
 • Validates columns
 • Normalises date columns
-• Maps item_name / item_barcode → item_id
+• Inventory upload: prevents duplicate item_name / item_barcode
+• Maps item_name / item_barcode → item_id for purchases & sales
 • Auto-adds new items (on Purchase Invoice only)
 • Updates current_stock using bill_type:
     - Purchases:  Purchase Invoice  (+), Purchase Return Invoice (−)
@@ -53,6 +54,68 @@ def _normalise_dates(df: pd.DataFrame, table: str) -> pd.DataFrame:
             )
     return df
 
+# ───────────────────────── Inventory validators ─────────────────────── #
+def _clean_and_validate_inventory_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalise text, ensure no duplicates in-file, and no collisions with DB.
+    - item_name: checked case-insensitively (after trim)
+    - item_barcode: checked as exact (after trim)
+    """
+    df = df.copy()
+
+    # Normalise strings
+    for col in ("item_name", "item_barcode", "category", "unit"):
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
+
+    # Coerce stocks to non-negative integers
+    for col in ("initial_stock", "current_stock"):
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+        if (df[col] < 0).any():
+            bad_rows = df.index[df[col] < 0].tolist()
+            raise ValueError(f"{col} must be ≥ 0 (rows {bad_rows}).")
+        df[col] = df[col].astype(int)
+
+    # Empty name / barcode is not allowed
+    if (df["item_name"] == "").any() or (df["item_barcode"] == "").any():
+        raise ValueError("item_name and item_barcode must not be empty.")
+
+    # Duplicate check inside the file
+    name_lower = df["item_name"].str.lower()
+    dup_names = df[name_lower.duplicated(keep=False)]["item_name"].unique().tolist()
+    dup_barcodes = df[df["item_barcode"].duplicated(keep=False)]["item_barcode"].unique().tolist()
+
+    msgs = []
+    if dup_names:
+        msgs.append("Duplicate item_name(s) in upload: " + ", ".join(sorted(dup_names)[:10]))
+    if dup_barcodes:
+        msgs.append("Duplicate item_barcode(s) in upload: " + ", ".join(sorted(dup_barcodes)[:10]))
+    if msgs:
+        raise ValueError(" | ".join(msgs))
+
+    # Collision check vs DB
+    existing = fetch_dataframe("SELECT item_name, item_barcode FROM inventory")
+    existing["item_name_norm"] = existing["item_name"].astype(str).str.strip().str.lower()
+    existing["item_barcode_norm"] = existing["item_barcode"].astype(str).str.strip()
+
+    names_in_db = set(existing["item_name_norm"])
+    codes_in_db = set(existing["item_barcode_norm"])
+
+    colliding_names = sorted(set(name_lower) & names_in_db)
+    colliding_codes = sorted(set(df["item_barcode"]) & codes_in_db)
+
+    msgs = []
+    if colliding_names:
+        # Show original names for user friendliness
+        original = df[df["item_name"].str.lower().isin(colliding_names)]["item_name"].unique().tolist()
+        msgs.append("Already exists (item_name): " + ", ".join(sorted(original)[:10]))
+    if colliding_codes:
+        msgs.append("Already exists (item_barcode): " + ", ".join(sorted(colliding_codes)[:10]))
+    if msgs:
+        raise ValueError(" | ".join(msgs))
+
+    return df
+
 # ───────────────────────── Sign from bill_type ──────────────────────── #
 def _row_sign(table: str, bill_type: str) -> int:
     """
@@ -79,6 +142,8 @@ def upsert_dataframe(conn,
     if table in ("purchases", "sales"):
         df = _handle_purchases_or_sales(conn, df, table)
     else:
+        # STRICT inventory insert: prevent duplicates before writing
+        df = _clean_and_validate_inventory_df(df)
         _insert_dataframe(conn, df, "inventory")
 
 # ───────────────────────── Purchases / Sales logic ──────────────────── #
