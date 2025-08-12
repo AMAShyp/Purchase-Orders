@@ -1,5 +1,4 @@
-# upload.py – FAST v1.1 (headers-match-only COPY bulk insert)
-
+# upload.py – FAST v1.2 (subset headers + numeric coercion)
 import time
 from io import StringIO, BytesIO
 from typing import List
@@ -7,7 +6,6 @@ from typing import List
 import pandas as pd
 import streamlit as st
 
-# Relative imports with fallback
 try:
     from .upload_handler import bulk_insert_exact_headers, get_row_count
 except Exception:
@@ -15,27 +13,22 @@ except Exception:
 
 
 def _read_file(file) -> pd.DataFrame:
-    """Read CSV or Excel, no value checks; just load to DataFrame."""
     t0 = time.perf_counter()
     if file.type == "text/csv":
-        # Try pyarrow backend if available; fall back if not.
         try:
             df = pd.read_csv(StringIO(file.getvalue().decode("utf-8")), dtype_backend="pyarrow")
         except TypeError:
             df = pd.read_csv(StringIO(file.getvalue().decode("utf-8")))
     else:
         df = pd.read_excel(BytesIO(file.getvalue()))
-    ms = (time.perf_counter() - t0) * 1000
-    st.caption(f"📥 File read in {ms:,.0f} ms")
+    st.caption(f"📥 File read in {(time.perf_counter() - t0)*1000:,.0f} ms")
     return df
-
 
 def _make_template(columns: List[str]) -> bytes:
     buf = BytesIO()
     pd.DataFrame(columns=columns).to_excel(buf, index=False, engine="openpyxl")
     buf.seek(0)
     return buf.read()
-
 
 TABLES = {
     "Inventory": "inventory",
@@ -44,7 +37,7 @@ TABLES = {
 }
 
 def _section(label: str, table: str, template_cols: List[str]):
-    st.subheader(f"{label}")
+    st.subheader(label)
 
     c1, c2 = st.columns([1, 3], vertical_alignment="center")
     with c1:
@@ -56,7 +49,11 @@ def _section(label: str, table: str, template_cols: List[str]):
             key=f"tmpl_{table}",
         )
     with c2:
-        st.caption("Upload CSV for best speed. Only header names must match the DB table; values are inserted as-is.")
+        st.caption(
+            "CSV is fastest. We insert **as-is** when headers match table columns (subset allowed). "
+            "Numeric columns are auto-cleaned (commas removed; integers rounded). "
+            "Do **not** include auto/default columns like `item_id`, `created_at`, `updated_at`."
+        )
 
     file = st.file_uploader(
         f"Choose CSV/Excel for **{table}**",
@@ -76,7 +73,7 @@ def _section(label: str, table: str, template_cols: List[str]):
         st.warning(f"Pre-insert row count failed: {e}")
         before = None
 
-    # Read file
+    # Load
     df = _read_file(file)
     st.write(f"Rows: **{df.shape[0]:,}**, Columns: **{df.shape[1]}**")
     st.dataframe(df.head(200), use_container_width=True, height=320)
@@ -90,13 +87,17 @@ def _section(label: str, table: str, template_cols: List[str]):
                 total_ms = (time.perf_counter() - t0) * 1000
 
                 status.update(label="Commit successful ✅", state="complete")
-                st.success(f"Inserted **{result['rows']:,}** rows into `{table}` "
-                           f"(COPY used: **{result['used_copy']}**)")
+                st.success(
+                    f"Inserted **{result['rows']:,}** rows into `{table}` "
+                    f"(COPY used: **{result['used_copy']}**)"
+                )
 
                 timings = result["timings"]
                 st.write({
+                    "used_columns": result.get("used_columns"),
                     "fetch_columns_ms": round(timings.get("fetch_columns_ms", 0), 1),
                     "align_columns_ms": round(timings.get("align_columns_ms", 0), 1),
+                    "numeric_coercion_ms": round(timings.get("numeric_coercion_ms", 0), 1),
                     "copy_or_insert_ms": round(timings.get("copy_or_insert_ms", 0), 1),
                     "executemany_ms": round(timings.get("executemany_ms", 0), 1),
                     "total_ms (handler)": round(timings.get("total_ms", 0), 1),
@@ -119,27 +120,28 @@ def _section(label: str, table: str, template_cols: List[str]):
 
     st.divider()
 
-
 def page():
-    st.title("⚡ Bulk Upload (Headers‑Match Only)")
-    st.caption("Fast path: as long as your file headers match the DB table, rows are inserted as-is. No extra checks.")
+    st.title("⚡ Bulk Upload (Headers‑Match, Ultra‑Fast)")
+    st.caption("Provide only the columns you want to insert. We skip auto/default columns.")
 
+    # Inventory: exclude item_id, created_at, updated_at
     _section(
         "Inventory Items",
         TABLES["Inventory"],
-        ["item_id","item_name","item_barcode","category","initial_stock","current_stock","unit","created_at","updated_at"],
+        ["item_name","item_barcode","category","unit","initial_stock","current_stock"],
     )
+
+    # (Keep these if you also bulk load purchases/sales; otherwise remove)
     _section(
         "Daily Purchases",
         TABLES["Purchases"],
-        ["purchase_id","bill_type","purchase_date","item_id","item_name","item_barcode","quantity","purchase_price"],
+        ["bill_type","purchase_date","item_id","item_name","item_barcode","quantity","purchase_price"],
     )
     _section(
         "Daily Sales",
         TABLES["Sales"],
-        ["sale_id","bill_type","sale_date","item_id","item_name","item_barcode","quantity","sale_price"],
+        ["bill_type","sale_date","item_id","item_name","item_barcode","quantity","sale_price"],
     )
-
 
 if __name__ == "__main__":
     st.set_page_config(page_title="Upload (FAST)", page_icon="⚡", layout="wide")
