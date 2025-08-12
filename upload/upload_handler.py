@@ -1,14 +1,14 @@
-# upload_handler.py – v6
+# upload_handler.py – v6 (final)
 # • Validates columns
 # • Normalises date columns
 # • Maps item_name / item_barcode → item_id
 # • Auto-adds new items (on Purchase Invoice only) with ON CONFLICT safety
 # • Updates current_stock using bill_type (atomic aggregated UPDATE)
-# • Verbose debug logs before/during/after inserts
+# • Verbose debug logs before/during/after inserts (DebugSink)
 
 from __future__ import annotations
 import pandas as pd
-from typing import Literal, Optional, Dict, Any, List
+from typing import Literal, Optional, Dict, List
 from sqlalchemy import text
 from db_handler import fetch_dataframe, run_transaction
 
@@ -145,22 +145,23 @@ def _handle_purchases_or_sales(conn, df: pd.DataFrame, table: str, dbg: DebugSin
 
     dbg.log(f"[resolve] Need mapping for {len(need_names)} names, {len(need_codes)} barcodes.")
 
-    inv = fetch_dataframe(
-        "SELECT item_id, item_name, item_barcode FROM inventory "
-        "WHERE item_name = ANY(:names) OR item_barcode = ANY(:codes);",
-    )
-    # Some drivers need explicit params dict:
-    inv = fetch_dataframe(
-        "SELECT item_id, item_name, item_barcode FROM inventory "
-        "WHERE item_name = ANY(%(names)s) OR item_barcode = ANY(%(codes)s);",
-        params={"names": list(need_names) or ["__none__"], "codes": list(need_codes) or ["__none__"]},
-    )
+    # Try param form; if the app's fetch_dataframe doesn't support params, fall back.
+    inv = pd.DataFrame()
+    try:
+        inv = fetch_dataframe(
+            "SELECT item_id, item_name, item_barcode FROM inventory "
+            "WHERE item_name = ANY(%(names)s) OR item_barcode = ANY(%(codes)s);",
+            params={"names": list(need_names) or ["__none__"], "codes": list(need_codes) or ["__none__"]},
+        )
+    except Exception as e:
+        dbg.log(f"[resolve] Param query failed ({e}); falling back to full scan for mapping.")
+        inv = fetch_dataframe("SELECT item_id, item_name, item_barcode FROM inventory;")
 
-    name2id = {}
-    code2id = {}
+    name2id: Dict[str, int] = {}
+    code2id: Dict[str, int] = {}
     if not inv.empty:
+        # Note: if duplicates exist, last one wins (OK for lookup)
         name2id = inv.set_index("item_name")["item_id"].to_dict()
-        # Be careful: duplicates could exist if DB was dirty; last wins (fine for lookup)
         code2id = inv.set_index("item_barcode")["item_id"].to_dict()
 
     dbg.log(f"[resolve] Pre-resolved {len(name2id)} by name, {len(code2id)} by barcode.")
@@ -174,11 +175,12 @@ def _handle_purchases_or_sales(conn, df: pd.DataFrame, table: str, dbg: DebugSin
 
         item_id = row.get("item_id")
         if pd.notna(item_id):
+            df.at[idx, "item_id"] = int(item_id)
             continue
 
         candidate = None
-        nm = row.get("item_name")
-        bc = row.get("item_barcode")
+        nm = (row.get("item_name") or "").strip()
+        bc = (row.get("item_barcode") or "").strip()
 
         if nm and nm in name2id:
             candidate = name2id[nm]
@@ -205,8 +207,8 @@ def _handle_purchases_or_sales(conn, df: pd.DataFrame, table: str, dbg: DebugSin
                     RETURNING item_id;
                 """)
                 item_id_new = conn.execute(ins, {
-                    "name": (nm or "").strip() or None,
-                    "code": (bc or "").strip() or None,
+                    "name": nm or None,
+                    "code": bc or None,
                     "cat":  (row.get("category") or "Uncategorized"),
                     "unit": (row.get("unit") or "Psc"),
                     "qty":  qty
