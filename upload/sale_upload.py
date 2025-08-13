@@ -1,4 +1,4 @@
-# sale_upload.py – FAST (Purchases & Sales uploads, headers-subset, numeric coercion)
+# sale_upload.py – FAST uploads for Purchases & Sales (headers-subset, numeric coercion)
 import time
 from io import StringIO, BytesIO
 from typing import List
@@ -6,18 +6,28 @@ from typing import List
 import pandas as pd
 import streamlit as st
 
-# Relative imports with fallback
+# Prefer the explicit helpers; fallback to generic if needed
 try:
-    from .upload_handler import bulk_insert_exact_headers, get_row_count
+    from .upload_handler import (
+        bulk_insert_purchases,
+        bulk_insert_sales,
+        get_row_count,
+    )
 except Exception:
-    from upload_handler import bulk_insert_exact_headers, get_row_count
+    from upload_handler import (
+        bulk_insert_purchases,
+        bulk_insert_sales,
+        get_row_count,
+    )
 
 
-# ---------- file I/O ----------
+# ───────────────────────── file I/O ───────────────────────── #
+
 def _read_file(file) -> pd.DataFrame:
+    """Read CSV or Excel without value checks (fast path)."""
     t0 = time.perf_counter()
     if file.type == "text/csv":
-        # CSV is fastest
+        # CSV is fastest; try pandas 2.x pyarrow backend if available
         try:
             df = pd.read_csv(StringIO(file.getvalue().decode("utf-8")), dtype_backend="pyarrow")
         except TypeError:
@@ -27,26 +37,49 @@ def _read_file(file) -> pd.DataFrame:
     st.caption(f"📥 File read in {(time.perf_counter() - t0)*1000:,.0f} ms")
     return df
 
+
 def _make_template(columns: List[str]) -> bytes:
+    """Small helper to export an Excel template for convenience."""
     buf = BytesIO()
     pd.DataFrame(columns=columns).to_excel(buf, index=False, engine="openpyxl")
     buf.seek(0)
     return buf.read()
 
 
-# ---------- Purchases & Sales templates (no IDs/timestamps) ----------
+# ───────────────────────── templates (omit IDs/timestamps) ───────────────────────── #
+
 PURCHASES_TEMPLATE_COLS = [
-    # Keep only user-supplied columns (IDs/timestamps are auto/default in DB)
-    "bill_type", "purchase_date", "item_id", "item_name", "item_barcode", "quantity", "purchase_price",
+    # Subset allowed; DB will fill any omitted defaults (IDs/timestamps)
+    "bill_type",
+    "purchase_date",
+    "item_id",
+    "item_name",
+    "item_barcode",
+    "quantity",
+    "purchase_price",
 ]
 
 SALES_TEMPLATE_COLS = [
-    "bill_type", "sale_date", "item_id", "item_name", "item_barcode", "quantity", "sale_price",
+    "bill_type",
+    "sale_date",
+    "item_id",
+    "item_name",
+    "item_barcode",
+    "quantity",
+    "sale_price",
 ]
 
 
-# ---------- Shared section helper ----------
-def _section(label: str, table: str, template_cols: List[str], key_prefix: str):
+# ───────────────────────── shared UI section ───────────────────────── #
+
+def _upload_section(
+    *,
+    label: str,
+    table: str,                # "purchases" | "sales"
+    template_cols: List[str],
+    call_fn,                   # bulk_insert_purchases or bulk_insert_sales
+    key_prefix: str,
+):
     st.subheader(label)
 
     c1, c2 = st.columns([1, 3], vertical_alignment="center")
@@ -61,8 +94,8 @@ def _section(label: str, table: str, template_cols: List[str], key_prefix: str):
     with c2:
         st.caption(
             "CSV is fastest. We insert **as-is** when your headers match table columns (subset allowed). "
-            "Numeric columns (e.g., `quantity`, `*_price`) are auto-cleaned: commas removed; "
-            "integer columns are rounded. If you leave out ID/timestamp columns, the database fills them."
+            "Numeric fields (e.g., `quantity`, `*_price`) are auto-cleaned: commas removed; integers rounded. "
+            "Leave out IDs/timestamps if your DB fills them by default."
         )
 
     file = st.file_uploader(
@@ -93,8 +126,8 @@ def _section(label: str, table: str, template_cols: List[str], key_prefix: str):
         with st.status("Running bulk insert…", expanded=True) as status:
             try:
                 t0 = time.perf_counter()
-                # Decorator injects DB connection; we pass keyword args
-                result = bulk_insert_exact_headers(df=df, table=table)
+                # The handler decorator injects `conn`; we pass keyword args only
+                result = call_fn(df=df)
                 total_ms = (time.perf_counter() - t0) * 1000
 
                 status.update(label="Commit successful ✅", state="complete")
@@ -132,13 +165,27 @@ def _section(label: str, table: str, template_cols: List[str], key_prefix: str):
     st.divider()
 
 
-# ---------- Page ----------
+# ───────────────────────── page entry ───────────────────────── #
+
 def page():
-    st.title("🧾 Purchases & Sales Bulk Upload (FAST)")
+    st.title("🧾 Bulk Upload — Purchases & Sales (FAST)")
     st.caption("Provide only the columns you want to insert. IDs/timestamps can be omitted and will be filled by the DB.")
 
-    _section("Daily Purchases", "purchases", PURCHASES_TEMPLATE_COLS, key_prefix="purchases")
-    _section("Daily Sales", "sales", SALES_TEMPLATE_COLS, key_prefix="sales")
+    _upload_section(
+        label="Daily Purchases",
+        table="purchases",
+        template_cols=PURCHASES_TEMPLATE_COLS,
+        call_fn=bulk_insert_purchases,
+        key_prefix="purchases",
+    )
+
+    _upload_section(
+        label="Daily Sales",
+        table="sales",
+        template_cols=SALES_TEMPLATE_COLS,
+        call_fn=bulk_insert_sales,
+        key_prefix="sales",
+    )
 
 
 if __name__ == "__main__":
