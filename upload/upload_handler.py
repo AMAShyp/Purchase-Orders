@@ -1,9 +1,10 @@
-# upload_handler.py – FAST v1.3
+# upload_handler.py – FAST v1.4
 # Bulk insert using COPY with:
 # - subset header mode (only provided columns are inserted; all must exist in table)
 # - auto numeric coercion (commas/decimals → integer for integer columns; numeric kept numeric)
 # - ignores auto/default columns (e.g., item_id, created_at, updated_at) if not provided
 # - signature compatible with run_transaction(conn, ...)
+# - convenience wrappers for purchases/sales + helper to fetch template columns
 
 from __future__ import annotations
 
@@ -51,6 +52,32 @@ def _get_numeric_columns(conn, table: str, schema: str = "public") -> Set[str]:
           AND data_type IN ('numeric','real','double precision')
     """)
     return {r[0] for r in conn.execute(q, {"schema": schema, "table": table}).fetchall()}
+
+def get_insertable_columns(table: str, schema: str = "public") -> List[str]:
+    """
+    Public helper: returns a sensible template column list for uploads:
+    excludes identity/serial primary keys and typical timestamp defaults.
+    (Uses fetch_dataframe; safe to call from UI.)
+    """
+    q = f"""
+        SELECT column_name, is_identity, column_default
+        FROM information_schema.columns
+        WHERE table_schema = '{schema}' AND table_name = '{table}'
+        ORDER BY ordinal_position
+    """
+    df = fetch_dataframe(q)
+    cols: List[str] = []
+    for _, r in df.iterrows():
+        name = r["column_name"]
+        is_identity = (str(r["is_identity"]).upper() == "YES")
+        default = str(r["column_default"] or "")
+        # Skip identity/serial, and typical timestamp defaults
+        if is_identity:
+            continue
+        if name.lower() in ("created_at", "updated_at"):
+            continue
+        cols.append(name)
+    return cols
 
 
 # ───────────────────────── DF alignment & coercion ───────────────────────── #
@@ -113,7 +140,7 @@ def _to_csv_buffer(df: pd.DataFrame) -> io.StringIO:
     return buf
 
 
-# ───────────────────────── public API ───────────────────────── #
+# ───────────────────────── core API ───────────────────────── #
 
 @run_transaction
 def bulk_insert_exact_headers(conn, *, df: pd.DataFrame, table: str, schema: str = "public") -> Dict[str, Any]:
@@ -193,6 +220,18 @@ def get_row_count(table: str, schema: str = "public") -> int:
     q = f'SELECT COUNT(*) FROM "{schema}"."{table}"'
     df = fetch_dataframe(q)
     return int(df.iloc[0, 0])
+
+
+# ───────────────────────── convenience wrappers ───────────────────────── #
+# (So sale_upload.py can call explicit helpers, or keep using the generic one.)
+
+@run_transaction
+def bulk_insert_purchases(conn, *, df: pd.DataFrame, schema: str = "public") -> Dict[str, Any]:
+    return bulk_insert_exact_headers(conn, df=df, table="purchases", schema=schema)
+
+@run_transaction
+def bulk_insert_sales(conn, *, df: pd.DataFrame, schema: str = "public") -> Dict[str, Any]:
+    return bulk_insert_exact_headers(conn, df=df, table="sales", schema=schema)
 
 
 # Back-compat alias for older imports (`upsert_dataframe(df=..., table=...)`)
