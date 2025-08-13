@@ -266,13 +266,37 @@ def _resolve_item_ids_and_create(
     df: pd.DataFrame,
     allow_create_positive_purchases: bool = True,
 ) -> Tuple[pd.DataFrame, Dict[int, int]]:
+    """
+    STRICT pair matching:
+      - Each row MUST have both item_name and item_barcode (non-empty after str/strip).
+      - If (name, barcode) pair maps to an existing inventory row → use it.
+      - If name or barcode exists but NOT the exact pair → error (mismatch).
+      - If neither exists:
+          * create item ONLY for positive purchases (purchase invoice direct / purchase invoice),
+            otherwise error.
+    Returns (df_with_item_id, created_map).
+    """
     df2 = df.copy()
 
-    names = set(df2.get("item_name", pd.Series([], dtype="object")).dropna().astype(str).str.strip())
-    barcodes = set(df2.get("item_barcode", pd.Series([], dtype="object")).dropna().astype(str).str.strip())
-    if not names and not barcodes:
-        raise ValueError("Need item_name or item_barcode to resolve items.")
+    # Normalize to strings early
+    df2["item_name"] = df2.get("item_name", pd.Series([], dtype="object")).map(lambda v: str(v or "").strip())
+    df2["item_barcode"] = df2.get("item_barcode", pd.Series([], dtype="object")).map(lambda v: str(v or "").strip())
+    df2["bill_type"] = df2.get("bill_type", pd.Series([], dtype="object")).map(lambda v: str(v or "").strip().lower())
 
+    # Require both fields per row
+    missing_mask = (df2["item_name"] == "") | (df2["item_barcode"] == "")
+    if missing_mask.any():
+        bad_idx = missing_mask[missing_mask].index.tolist()[:5]
+        raise ValueError(
+            f"Rows {bad_idx} missing item_name and/or item_barcode. "
+            "Both are required for strict pair matching."
+        )
+
+    # Build lookup sets
+    names = set(df2["item_name"])
+    barcodes = set(df2["item_barcode"])
+
+    # Fetch inventory (id, name, barcode) — single scan
     try:
         inv = fetch_dataframe(
             """
@@ -285,52 +309,102 @@ def _resolve_item_ids_and_create(
     except Exception:
         inv = fetch_dataframe("SELECT item_id, item_name, item_barcode FROM inventory;")
 
-    name2id = inv.set_index("item_name")["item_id"].to_dict() if not inv.empty else {}
-    code2id = inv.set_index("item_barcode")["item_id"].to_dict() if not inv.empty else {}
+    # Build maps
+    name_map: Dict[str, Tuple[int, Optional[str]]] = {}
+    code_map: Dict[str, Tuple[int, Optional[str]]] = {}
+    pair_map: Dict[Tuple[str, str], int] = {}
+
+    if not inv.empty:
+        for _, r in inv.iterrows():
+            iid = int(r["item_id"])
+            nm = str(r["item_name"] or "").strip()
+            bc = str(r["item_barcode"] or "").strip()
+            if nm:
+                name_map[nm] = (iid, bc if bc else None)
+            if bc:
+                code_map[bc] = (iid, nm if nm else None)
+            if nm and bc:
+                pair_map[(nm, bc)] = iid
 
     created: Dict[int, int] = {}
-
     if "item_id" not in df2.columns:
         df2["item_id"] = pd.NA
 
+    # Process rows
     for idx, row in df2.iterrows():
         if pd.notna(row.get("item_id")):
+            # If user provided item_id we could verify it matches the pair; but since you don't supply it, skip.
             continue
 
-        nm = str(row.get("item_name") or "").strip()
-        bc = str(row.get("item_barcode") or "").strip()
-        bt = str(row.get("bill_type") or "").strip().lower()
+        nm = row["item_name"]
+        bc = row["item_barcode"]
+        bt = row["bill_type"]  # already lowercased
 
-        candidate = None
-        if nm and nm in name2id:
-            candidate = name2id[nm]
-        if bc and bc in code2id:
-            if candidate is not None and code2id[bc] != candidate:
-                raise ValueError(f"Row {idx}: item_name and item_barcode refer to different items.")
-            candidate = code2id[bc]
+        # 1) Exact (name, barcode) pair exists → OK
+        if (nm, bc) in pair_map:
+            df2.at[idx, "item_id"] = int(pair_map[(nm, bc)])
+            continue
 
-        if candidate is None and allow_create_positive_purchases and bt in ("purchase invoice direct", "purchase invoice"):
+        # 2) Pair not found. Check for conflicts:
+        name_hit = name_map.get(nm)  # (id, barcode_or_none)
+        code_hit = code_map.get(bc)  # (id, name_or_none)
+
+        if name_hit and code_hit:
+            # Both exist separately, but not as the same pair.
+            if name_hit[0] != code_hit[0]:
+                raise ValueError(
+                    f"Row {idx}: item_name and item_barcode refer to different existing items "
+                    f"(name→id {name_hit[0]}, barcode→id {code_hit[0]})."
+                )
+            # Same id but stored pair missing? (e.g., DB has name without barcode or vice versa)
+            # For safety in strict mode, do not mutate inventory linkage here; just use the id.
+            df2.at[idx, "item_id"] = int(name_hit[0])
+            continue
+
+        if name_hit and not code_hit:
+            # Name exists with a different barcode or with NULL barcode; strict mode → error
+            nm_id, nm_bc = name_hit
+            raise ValueError(
+                f"Row {idx}: item_name exists in inventory (id {nm_id}) "
+                f"but the provided barcode '{bc}' does not match stored barcode '{nm_bc or ''}'."
+            )
+
+        if code_hit and not name_hit:
+            # Barcode exists with a different name or with NULL name; strict mode → error
+            bc_id, bc_nm = code_hit
+            raise ValueError(
+                f"Row {idx}: item_barcode exists in inventory (id {bc_id}) "
+                f"but the provided name '{nm}' does not match stored name '{bc_nm or ''}'."
+            )
+
+        # 3) Neither name nor barcode exists → create ONLY for positive purchases
+        is_positive_purchase = bt in ("purchase invoice direct", "purchase invoice")
+        if allow_create_positive_purchases and is_positive_purchase:
             ins = text("""
                 INSERT INTO inventory (item_name, item_barcode, category, unit, initial_stock, current_stock)
                 VALUES (:name, :code, :cat, :unit, 0, 0)
-                ON CONFLICT (item_name, item_barcode) DO UPDATE SET updated_at = CURRENT_TIMESTAMP
                 RETURNING item_id;
             """)
             item_id_new = conn.execute(ins, {
-                "name": nm or None,
-                "code": bc or None,
-                "cat":  (row.get("category") or "Uncategorized"),
-                "unit": (row.get("unit") or "Psc"),
+                "name": nm,
+                "code": bc,
+                "cat":  (str(row.get("category") or "Uncategorized").strip()),
+                "unit": (str(row.get("unit") or "Psc").strip()),
             }).scalar_one()
-            candidate = int(item_id_new)
-            if nm: name2id[nm] = candidate
-            if bc: code2id[bc] = candidate
-            created[candidate] = 0
+            iid = int(item_id_new)
+            df2.at[idx, "item_id"] = iid
+            # update maps for subsequent rows in the same batch
+            name_map[nm] = (iid, bc)
+            code_map[bc] = (iid, nm)
+            pair_map[(nm, bc)] = iid
+            created[iid] = 0
+            continue
 
-        if candidate is None:
-            raise ValueError(f"Row {idx}: unknown item (name/barcode not found) for bill_type='{bt}'.")
-
-        df2.at[idx, "item_id"] = int(candidate)
+        # Otherwise cannot resolve
+        raise ValueError(
+            f"Row {idx}: unknown item (name+barcode pair not found). "
+            f"For sales/returns, the item must already exist. For positive purchases, creation is allowed."
+        )
 
     df2["item_id"] = pd.to_numeric(df2["item_id"], errors="raise").astype(int)
     return df2, created
