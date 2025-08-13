@@ -38,20 +38,29 @@ st.set_page_config(page_title="Hypermarket App", page_icon="📦", layout="wide"
 st.sidebar.title("Navigation")
 choice = st.sidebar.radio(
     "Go to",
-    ("Dashboard", "Upload", "Reorder"),
+    ("Dashboard", "Inventory Upload", "Sales & Purchases Upload", "Reorder"),
     index=0,
 )
 
 if choice == "Dashboard":
     dashboard()
 
-elif choice == "Upload":
-    # Lazy-import the page and surface any import errors
+elif choice == "Inventory Upload":
+    # Lazy-import Inventory upload page
     try:
-        upload_module = importlib.import_module("upload.upload")
+        upload_module = importlib.import_module("upload.upload")  # inventory-only page
         upload_module.page()
     except Exception as e:
-        st.error("❌ Failed to load *Upload* page:")
+        st.error("❌ Failed to load *Inventory Upload* page:")
+        st.exception(e)
+
+elif choice == "Sales & Purchases Upload":
+    # Lazy-import Sales & Purchases upload page
+    try:
+        sale_upload_module = importlib.import_module("upload.sale_upload")
+        sale_upload_module.page()
+    except Exception as e:
+        st.error("❌ Failed to load *Sales & Purchases Upload* page:")
         st.exception(e)
 
 else:  # "Reorder"
