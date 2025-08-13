@@ -1,4 +1,4 @@
-# upload.py – FAST v1.3 (subset headers + numeric coercion; decorator-safe call)
+# upload.py – Inventory-only (FAST, headers-subset, numeric coercion)
 import time
 from io import StringIO, BytesIO
 from typing import List
@@ -6,16 +6,18 @@ from typing import List
 import pandas as pd
 import streamlit as st
 
-# Relative imports with fallback
+# Relative imports with fallback (package vs flat)
 try:
     from .upload_handler import bulk_insert_exact_headers, get_row_count
 except Exception:
     from upload_handler import bulk_insert_exact_headers, get_row_count
 
 
+# ---------- file I/O ----------
 def _read_file(file) -> pd.DataFrame:
     t0 = time.perf_counter()
     if file.type == "text/csv":
+        # CSV is fastest
         try:
             df = pd.read_csv(StringIO(file.getvalue().decode("utf-8")), dtype_backend="pyarrow")
         except TypeError:
@@ -31,34 +33,36 @@ def _make_template(columns: List[str]) -> bytes:
     buf.seek(0)
     return buf.read()
 
-TABLES = {
-    "Inventory": "inventory",
-    "Purchases": "purchases",
-    "Sales":     "sales",
-}
 
-def _section(label: str, table: str, template_cols: List[str]):
-    st.subheader(label)
+# ---------- Inventory Upload Section ----------
+INVENTORY_TEMPLATE_COLS = [
+    # Only user-supplied columns (skip auto/default columns)
+    "item_name", "item_barcode", "category", "unit", "initial_stock", "current_stock",
+]
+
+def _inventory_section():
+    st.subheader("Inventory Items")
 
     c1, c2 = st.columns([1, 3], vertical_alignment="center")
     with c1:
         st.download_button(
             "📄 Excel template (optional)",
-            data=_make_template(template_cols),
-            file_name=f"{table}_template.xlsx",
+            data=_make_template(INVENTORY_TEMPLATE_COLS),
+            file_name="inventory_template.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key=f"tmpl_{table}",
+            key="tmpl_inventory",
         )
     with c2:
         st.caption(
-            "CSV is fastest. We insert **as-is** when headers match table columns (subset allowed). "
-            "Numeric columns are auto-cleaned (commas removed; integers rounded). "
-            "Do **not** include auto/default columns like `item_id`, `created_at`, `updated_at`."
+            "CSV is fastest. We insert **as-is** when your headers match table columns (subset allowed). "
+            "Do **not** include `item_id`, `created_at`, `updated_at` — the database fills those. "
+            "Numeric columns (e.g., `initial_stock`, `current_stock`) are auto-cleaned: commas removed, "
+            "decimals rounded to integers."
         )
 
     file = st.file_uploader(
-        f"Choose CSV/Excel for **{table}**",
-        key=f"upl_{table}",
+        "Choose CSV/Excel for **inventory**",
+        key="upl_inventory",
         type=["csv", "xlsx", "xls"],
     )
     if file is None:
@@ -68,29 +72,28 @@ def _section(label: str, table: str, template_cols: List[str]):
 
     # Before count
     try:
-        before = get_row_count(table)
-        st.info(f"🔎 Before insert → `{table}` rows: {before:,}")
+        before = get_row_count("inventory")
+        st.info(f"🔎 Before insert → `inventory` rows: {before:,}")
     except Exception as e:
         st.warning(f"Pre-insert row count failed: {e}")
         before = None
 
-    # Load
+    # Read & preview
     df = _read_file(file)
     st.write(f"Rows: **{df.shape[0]:,}**, Columns: **{df.shape[1]}**")
     st.dataframe(df.head(200), use_container_width=True, height=320)
     st.caption("Preview shows up to 200 rows. Upload will insert all rows.")
 
-    if st.button(f"✅ Bulk insert into `{table}`", key=f"btn_{table}", type="primary"):
+    if st.button("✅ Bulk insert into `inventory`", key="btn_inventory", type="primary"):
         with st.status("Running bulk insert…", expanded=True) as status:
             try:
                 t0 = time.perf_counter()
-                # NOTE: call with keywords; decorator injects `conn` transparently
-                result = bulk_insert_exact_headers(df=df, table=table)
+                result = bulk_insert_exact_headers(df=df, table="inventory")
                 total_ms = (time.perf_counter() - t0) * 1000
 
                 status.update(label="Commit successful ✅", state="complete")
                 st.success(
-                    f"Inserted **{result['rows']:,}** rows into `{table}` "
+                    f"Inserted **{result['rows']:,}** rows into `inventory` "
                     f"(COPY used: **{result['used_copy']}**)"
                 )
 
@@ -107,12 +110,12 @@ def _section(label: str, table: str, template_cols: List[str]):
                 })
 
                 try:
-                    after = get_row_count(table)
+                    after = get_row_count("inventory")
                     if before is not None:
-                        st.info(f"📊 After insert → `{table}` rows: {after:,} "
+                        st.info(f"📊 After insert → `inventory` rows: {after:,} "
                                 f"(+{after - before:,} new)")
                     else:
-                        st.info(f"📊 After insert → `{table}` rows: {after:,}")
+                        st.info(f"📊 After insert → `inventory` rows: {after:,}")
                 except Exception as e:
                     st.warning(f"Post-insert row count failed: {e}")
 
@@ -122,29 +125,13 @@ def _section(label: str, table: str, template_cols: List[str]):
 
     st.divider()
 
+
+# ---------- Page ----------
 def page():
-    st.title("⚡ Bulk Upload (Headers‑Match, Ultra‑Fast)")
+    st.title("⚡ Inventory Bulk Upload (Headers‑Match)")
     st.caption("Provide only the columns you want to insert. We skip auto/default columns.")
-
-    # Inventory: exclude item_id, created_at, updated_at
-    _section(
-        "Inventory Items",
-        TABLES["Inventory"],
-        ["item_name","item_barcode","category","unit","initial_stock","current_stock"],
-    )
-
-    # (Keep/remove purchases/sales sections as needed)
-    _section(
-        "Daily Purchases",
-        TABLES["Purchases"],
-        ["bill_type","purchase_date","item_id","item_name","item_barcode","quantity","purchase_price"],
-    )
-    _section(
-        "Daily Sales",
-        TABLES["Sales"],
-        ["bill_type","sale_date","item_id","item_name","item_barcode","quantity","sale_price"],
-    )
+    _inventory_section()
 
 if __name__ == "__main__":
-    st.set_page_config(page_title="Upload (FAST)", page_icon="⚡", layout="wide")
+    st.set_page_config(page_title="Inventory Upload (FAST)", page_icon="📦", layout="wide")
     page()
