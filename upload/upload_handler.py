@@ -297,9 +297,9 @@ def _resolve_item_ids_and_create(
         if pd.notna(row.get("item_id")):
             continue
 
-        nm = (row.get("item_name") or "").strip()
-        bc = (row.get("item_barcode") or "").strip()
-        bt = (row.get("bill_type") or "").strip().lower()
+        nm = str(row.get("item_name") or "").strip()
+        bc = str(row.get("item_barcode") or "").strip()
+        bt = str(row.get("bill_type") or "").strip().lower()
 
         candidate = None
         if nm and nm in name2id:
@@ -334,7 +334,7 @@ def _resolve_item_ids_and_create(
 
     df2["item_id"] = pd.to_numeric(df2["item_id"], errors="raise").astype(int)
     return df2, created
-
+    
 def _aggregate_deltas(df: pd.DataFrame) -> pd.DataFrame:
     tmp = df.copy()
     tmp["quantity"] = pd.to_numeric(tmp["quantity"], errors="coerce").fillna(0).round(0).astype(int)
