@@ -1,4 +1,4 @@
-# sale_upload.py – Unified Purchases & Sales upload (item_id resolved by name/barcode)
+# sale_upload.py – Unified Purchases & Sales upload (input/output quantity, no item_id in Excel)
 import time
 from io import StringIO, BytesIO
 from typing import List
@@ -13,16 +13,20 @@ except Exception:
 
 
 UNIFIED_TEMPLATE_COLS = [
-    # No item_id needed — we resolve from name/barcode
-    "bill_type",     # routes the row
-    "txn_date",      # will be renamed to purchase_date / sale_date
+    # No item_id needed — resolved by (item_name, item_barcode)
+    "bill_type",      # routes the row
+    "txn_date",       # → purchase_date / sale_date
     "item_name",
     "item_barcode",
-    "quantity",
-    "unit_price",    # will be renamed to purchase_price / sale_price
-    # Optional extras if you want to prefill inventory on first purchase:
+    "input_quantity",   # used when stock flows IN
+    "output_quantity",  # used when stock flows OUT
+    "unit_price",     # → purchase_price / sale_price (optional)
+    # Optional helper columns (used when auto-creating items on positive purchases):
     # "category", "unit"
 ]
+
+SALES_ALLOWED = ["sales invoice", "sales return invoice"]
+PURCHASES_ALLOWED = ["purchase invoice direct", "purchasing return invoice", "purchase invoice", "purchase return invoice"]
 
 def _read_file(file) -> pd.DataFrame:
     t0 = time.perf_counter()
@@ -56,10 +60,12 @@ def _section_unified():
         )
     with c2:
         st.caption(
-            "Use one sheet. We route rows by `bill_type`, resolve `item_id` from `item_name`/`item_barcode`, "
-            "insert into the right table, and update `inventory.current_stock` based on `bill_type`.\n\n"
-            "**Sales:** `sales invoice`, `sales return invoice`\n"
-            "**Purchases:** `purchase invoice direct`, `purchasing return invoice`"
+            "Use one sheet with headers: "
+            "`bill_type, txn_date, item_name, item_barcode, input_quantity, output_quantity, unit_price`.\n"
+            "We derive the single DB `quantity` per row:\n"
+            "• Input quantity → **purchase invoice direct**, **purchase invoice**, **sales return invoice**\n"
+            "• Output quantity → **sales invoice**, **purchasing return invoice**, **purchase return invoice**\n\n"
+            "Item IDs are resolved by (item_name, item_barcode); missing items on positive purchases are created."
         )
 
     file = st.file_uploader(
@@ -98,7 +104,6 @@ def _section_unified():
                 status.update(label="Commit successful ✅", state="complete")
                 st.success("Inserted into purchases/sales and updated inventory.")
 
-                # Summaries
                 st.write({
                     "purchases": result.get("purchases"),
                     "sales": result.get("sales"),
@@ -129,8 +134,8 @@ def _section_unified():
     st.divider()
 
 def page():
-    st.title("🧾 Unified Purchases & Sales Upload (item_id resolved)")
-    st.caption("No item_id in the sheet — we match by name/barcode, insert rows, and update stock.")
+    st.title("🧾 Unified Purchases & Sales Upload (input/output quantity)")
+    st.caption("No item_id needed — we resolve by name/barcode, derive quantity from input/output, and update stock.")
     _section_unified()
 
 if __name__ == "__main__":
