@@ -1,17 +1,18 @@
-# upload_handler.py – FAST v1.4
-# Bulk insert using COPY with:
-# - subset header mode (only provided columns are inserted; all must exist in table)
-# - auto numeric coercion (commas/decimals → integer for integer columns; numeric kept numeric)
-# - ignores auto/default columns (e.g., item_id, created_at, updated_at) if not provided
-# - signature compatible with run_transaction(conn, ...)
-# - convenience wrappers for purchases/sales + helper to fetch template columns
+# upload_handler.py – FAST v2.0
+# Core features:
+# - Fast COPY-based bulk insert with subset header mode (generic)
+# - Numeric coercion: commas removed; integer columns rounded
+# - Public helpers for row counts & template columns
+# - NEW: bulk_insert_unified_txns(...)  → split by bill_type, resolve item_id from
+#   (item_name, item_barcode), auto-create items on positive purchases, insert rows,
+#   and update inventory.current_stock based on bill_type sign.
 
 from __future__ import annotations
 
 import io
 import re
 import time
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional, Set, Tuple
 
 import pandas as pd
 from sqlalchemy import text
@@ -55,9 +56,8 @@ def _get_numeric_columns(conn, table: str, schema: str = "public") -> Set[str]:
 
 def get_insertable_columns(table: str, schema: str = "public") -> List[str]:
     """
-    Public helper: returns a sensible template column list for uploads:
+    Returns a sensible template column list for uploads:
     excludes identity/serial primary keys and typical timestamp defaults.
-    (Uses fetch_dataframe; safe to call from UI.)
     """
     q = f"""
         SELECT column_name, is_identity, column_default
@@ -70,8 +70,6 @@ def get_insertable_columns(table: str, schema: str = "public") -> List[str]:
     for _, r in df.iterrows():
         name = r["column_name"]
         is_identity = (str(r["is_identity"]).upper() == "YES")
-        default = str(r["column_default"] or "")
-        # Skip identity/serial, and typical timestamp defaults
         if is_identity:
             continue
         if name.lower() in ("created_at", "updated_at"):
@@ -90,12 +88,10 @@ def _align_subset_columns(df: pd.DataFrame, db_cols: List[str]) -> List[str]:
     db_lower_map = {c.lower(): c for c in db_cols}
     file_lowers = [c.lower() for c in df.columns]
 
-    # ensure every file column exists in table
     extra = [c for c in df.columns if c.lower() not in db_lower_map]
     if extra:
         raise ValueError(f"Unknown columns in file: {extra}")
 
-    # Select columns in DB order, but only those present in the file
     used_cols = [c for c in db_cols if c.lower() in file_lowers]
     return used_cols
 
@@ -107,14 +103,12 @@ def _coerce_numeric_like(df: pd.DataFrame, cols: List[str], as_int: bool) -> Non
         if c not in df.columns:
             continue
         s = df[c]
-        # Already numeric?
         if s.dtype.kind in "biufc":
             if as_int:
                 df[c] = pd.to_numeric(s, errors="coerce").fillna(0).round(0).astype("Int64")
             else:
                 df[c] = pd.to_numeric(s, errors="coerce")
             continue
-        # String-like → clean and parse
         s2 = s.astype(str).map(lambda x: _num_clean_re.sub("", x))
         s_num = pd.to_numeric(s2, errors="coerce")
         if as_int:
@@ -140,35 +134,29 @@ def _to_csv_buffer(df: pd.DataFrame) -> io.StringIO:
     return buf
 
 
-# ───────────────────────── core API ───────────────────────── #
+# ───────────────────────── core COPY insert (reusable) ───────────────────────── #
 
-@run_transaction
-def bulk_insert_exact_headers(conn, *, df: pd.DataFrame, table: str, schema: str = "public") -> Dict[str, Any]:
+def _bulk_insert_core(conn, *, df: pd.DataFrame, table: str, schema: str = "public") -> Dict[str, Any]:
     """
-    Fast subset-header bulk insert (decorator injects `conn` first):
-      - Reads DB columns (ordered)
-      - Uses only columns present in the file (must all exist in table)
-      - Auto-coerces numeric/integer columns for compatibility
-      - COPY FROM STDIN CSV with NULL '\\N'; fallback to executemany
+    Core engine used by all bulk-insert entry points (NOT decorated).
     """
     timings: Dict[str, float] = {}
     t0 = time.perf_counter()
 
-    # 1) Fetch table columns & numeric types
+    # Columns / types
     t = time.perf_counter()
     db_cols = _get_table_columns_ordered(conn, table, schema)
     int_cols = _get_integer_columns(conn, table, schema)
     num_cols = _get_numeric_columns(conn, table, schema)
     timings["fetch_columns_ms"] = (time.perf_counter() - t) * 1000
 
-    # 2) Align (subset) and reorder DF to used_cols
+    # Align subset
     t = time.perf_counter()
     df = df.dropna(how="all")
     if df.empty:
         raise ValueError("No data rows found.")
     used_cols = _align_subset_columns(df, db_cols)
 
-    # Build df2 with only used columns, rename to exact DB casing, ordered by DB
     lower2db = {c.lower(): c for c in db_cols}
     present_lower = {c.lower() for c in used_cols}
     df2 = df[[c for c in df.columns if c.lower() in present_lower]].copy()
@@ -176,7 +164,7 @@ def bulk_insert_exact_headers(conn, *, df: pd.DataFrame, table: str, schema: str
     df2 = df2[used_cols]
     timings["align_columns_ms"] = (time.perf_counter() - t) * 1000
 
-    # 3) Numeric coercion for any numeric columns present in file
+    # Coerce numerics
     t = time.perf_counter()
     present_int = [c for c in used_cols if c in int_cols]
     present_num = [c for c in used_cols if c in num_cols]
@@ -186,7 +174,7 @@ def bulk_insert_exact_headers(conn, *, df: pd.DataFrame, table: str, schema: str
         _coerce_numeric_like(df2, present_num, as_int=False)
     timings["numeric_coercion_ms"] = (time.perf_counter() - t) * 1000
 
-    # 4) COPY fast path
+    # COPY fast path
     rows = len(df2)
     used_copy = False
     t = time.perf_counter()
@@ -203,7 +191,7 @@ def bulk_insert_exact_headers(conn, *, df: pd.DataFrame, table: str, schema: str
             cur.close()
     timings["copy_or_insert_ms"] = (time.perf_counter() - t) * 1000
 
-    # 5) Fallback executemany
+    # Fallback executemany
     if not used_copy:
         t = time.perf_counter()
         placeholders = ", ".join([f":{c}" for c in used_cols])
@@ -216,25 +204,231 @@ def bulk_insert_exact_headers(conn, *, df: pd.DataFrame, table: str, schema: str
     return {"rows": rows, "used_copy": used_copy, "timings": timings, "used_columns": used_cols}
 
 
+# Public generic entry
+@run_transaction
+def bulk_insert_exact_headers(conn, *, df: pd.DataFrame, table: str, schema: str = "public") -> Dict[str, Any]:
+    return _bulk_insert_core(conn, df=df, table=table, schema=schema)
+
+
 def get_row_count(table: str, schema: str = "public") -> int:
     q = f'SELECT COUNT(*) FROM "{schema}"."{table}"'
     df = fetch_dataframe(q)
     return int(df.iloc[0, 0])
 
 
-# ───────────────────────── convenience wrappers ───────────────────────── #
-# (So sale_upload.py can call explicit helpers, or keep using the generic one.)
+# ───────────────────────── unified Purchases/Sales flow ───────────────────────── #
+
+SALE_TYPES = {
+    "sales invoice",
+    "sales return invoice",
+}
+PURCHASE_TYPES = {
+    "purchase invoice direct",
+    "purchasing return invoice",
+    # optional aliases:
+    "purchase invoice",
+    "purchase return invoice",
+}
+
+def _normalize_bill_type(s: pd.Series) -> pd.Series:
+    return s.fillna("").astype(str).str.strip().str.casefold()
+
+def _bill_sign(bt: str) -> int:
+    """+1 for positive to stock, -1 for negative to stock."""
+    bt = (bt or "").strip().lower()
+    if bt in ("sales invoice",):
+        return -1
+    if bt in ("sales return invoice",):
+        return +1
+    if bt in ("purchase invoice direct", "purchase invoice"):
+        return +1
+    if bt in ("purchasing return invoice", "purchase return invoice"):
+        return -1
+    # default to 0 (no change) if unrecognized (we filter these out)
+    return 0
+
+def _resolve_item_ids_and_create(
+    conn,
+    df: pd.DataFrame,
+    allow_create_positive_purchases: bool = True,
+) -> Tuple[pd.DataFrame, Dict[int, int]]:
+    """
+    Ensure df has an integer 'item_id' column. Uses (item_name, item_barcode) lookups;
+    optionally creates missing items on positive purchases. Returns (df, created_ids_counts),
+    where created_ids_counts maps item_id -> 0 (we create with stock 0; deltas will adjust).
+    """
+    df2 = df.copy()
+
+    # Build lookup sets
+    names = set(df2.get("item_name", pd.Series([], dtype="object")).dropna().astype(str).str.strip())
+    barcodes = set(df2.get("item_barcode", pd.Series([], dtype="object")).dropna().astype(str).str.strip())
+    if not names and not barcodes:
+        raise ValueError("Need item_name or item_barcode to resolve items.")
+
+    # Fetch inventory map for only needed keys (fallback to full scan if params unsupported)
+    try:
+        inv = fetch_dataframe(
+            """
+            SELECT item_id, item_name, item_barcode
+            FROM inventory
+            WHERE item_name = ANY(%(names)s) OR item_barcode = ANY(%(codes)s);
+            """,
+            params={"names": list(names) or ["__none__"], "codes": list(barcodes) or ["__none__"]},
+        )
+    except Exception:
+        inv = fetch_dataframe("SELECT item_id, item_name, item_barcode FROM inventory;")
+
+    name2id = inv.set_index("item_name")["item_id"].to_dict() if not inv.empty else {}
+    code2id = inv.set_index("item_barcode")["item_id"].to_dict() if not inv.empty else {}
+
+    created: Dict[int, int] = {}
+
+    # Ensure item_id filled
+    if "item_id" not in df2.columns:
+        df2["item_id"] = pd.NA
+
+    for idx, row in df2.iterrows():
+        if pd.notna(row.get("item_id")):
+            continue
+
+        nm = (row.get("item_name") or "").strip()
+        bc = (row.get("item_barcode") or "").strip()
+        bt = (row.get("bill_type") or "").strip().lower()
+
+        candidate = None
+        if nm and nm in name2id:
+            candidate = name2id[nm]
+        if bc and bc in code2id:
+            if candidate is not None and code2id[bc] != candidate:
+                raise ValueError(f"Row {idx}: item_name and item_barcode refer to different items.")
+            candidate = code2id[bc]
+
+        # Create for positive purchases only, if still unknown
+        if candidate is None and allow_create_positive_purchases and bt in ("purchase invoice direct", "purchase invoice"):
+            ins = text("""
+                INSERT INTO inventory (item_name, item_barcode, category, unit, initial_stock, current_stock)
+                VALUES (:name, :code, :cat, :unit, 0, 0)
+                ON CONFLICT (item_name, item_barcode) DO UPDATE SET updated_at = CURRENT_TIMESTAMP
+                RETURNING item_id;
+            """)
+            item_id_new = conn.execute(ins, {
+                "name": nm or None,
+                "code": bc or None,
+                "cat":  (row.get("category") or "Uncategorized"),
+                "unit": (row.get("unit") or "Psc"),
+            }).scalar_one()
+            candidate = int(item_id_new)
+            name2id[nm] = candidate if nm else candidate
+            if bc:
+                code2id[bc] = candidate
+            created[candidate] = 0  # created at 0; deltas will handle stock
+
+        if candidate is None:
+            raise ValueError(f"Row {idx}: unknown item (name/barcode not found) for bill_type='{bt}'.")
+
+        df2.at[idx, "item_id"] = int(candidate)
+
+    # Coerce item_id to int
+    df2["item_id"] = pd.to_numeric(df2["item_id"], errors="raise").astype(int)
+    return df2, created
+
+
+def _aggregate_deltas(df: pd.DataFrame) -> pd.DataFrame:
+    """Return DataFrame with columns: item_id, delta (int)."""
+    tmp = df.copy()
+    tmp["quantity"] = pd.to_numeric(tmp["quantity"], errors="coerce").fillna(0).round(0).astype(int)
+    tmp["__sign"] = tmp["bill_type"].astype(str).map(_bill_sign)
+    tmp["__delta"] = tmp["quantity"] * tmp["__sign"]
+    agg = tmp.groupby("item_id", as_index=False)["__delta"].sum().rename(columns={"__delta": "delta"})
+    agg = agg[agg["delta"] != 0]
+    return agg
+
+
+@run_transaction
+def bulk_insert_unified_txns(conn, *, df: pd.DataFrame, schema: str = "public") -> Dict[str, Any]:
+    """
+    Unified purchases/sales upload:
+      - expects at minimum: bill_type, txn_date, item_name or item_barcode, quantity
+        (unit_price optional)
+      - routes rows by bill_type → purchases vs sales
+      - renames txn_date/unit_price to per-table names
+      - resolves item_id (creates inventory rows for positive purchases if needed)
+      - inserts into purchases & sales (subset headers; COPY)
+      - updates inventory.current_stock by aggregated deltas
+    """
+    t0 = time.perf_counter()
+    out: Dict[str, Any] = {"purchases": None, "sales": None, "inventory_update": None}
+
+    if df.empty:
+        raise ValueError("No data rows found.")
+
+    # Normalize bill_type & route
+    df = df.copy()
+    df["bill_type"] = _normalize_bill_type(df.get("bill_type", pd.Series([], dtype="object")))
+    is_sale = df["bill_type"].isin(SALE_TYPES)
+    is_purchase = df["bill_type"].isin(PURCHASE_TYPES)
+    purchases_raw = df[is_purchase].copy()
+    sales_raw = df[is_sale].copy()
+    unknown = df[~(is_sale | is_purchase)].copy()
+
+    if not unknown.empty:
+        raise ValueError(f"{len(unknown)} rows have unknown bill_type values. "
+                         f"Allowed sales: {sorted(SALE_TYPES)} | purchases: {sorted(PURCHASE_TYPES)}")
+
+    # Resolve item_id & prepare per-table frames
+    # Purchases
+    res_p = None
+    if not purchases_raw.empty:
+        # rename shared columns for purchases
+        purchases_raw.rename(columns={"txn_date": "purchase_date", "unit_price": "purchase_price"}, inplace=True)
+        # resolve item_id (create items for positive purchases)
+        purchases_resolved, _created = _resolve_item_ids_and_create(conn, purchases_raw, allow_create_positive_purchases=True)
+        res_p = _bulk_insert_core(conn, df=purchases_resolved, table="purchases", schema=schema)
+        out["purchases"] = res_p
+
+    # Sales
+    res_s = None
+    if not sales_raw.empty:
+        sales_raw.rename(columns={"txn_date": "sale_date", "unit_price": "sale_price"}, inplace=True)
+        sales_resolved, _ = _resolve_item_ids_and_create(conn, sales_raw, allow_create_positive_purchases=False)
+        res_s = _bulk_insert_core(conn, df=sales_resolved, table="sales", schema=schema)
+        out["sales"] = res_s
+
+    # Compute and apply inventory deltas across BOTH subsets
+    if not df.empty:
+        deltas = _aggregate_deltas(df)
+        if not deltas.empty:
+            upd = text("""
+                WITH changes AS (
+                    SELECT UNNEST(:ids::int[]) AS item_id, UNNEST(:ds::int[]) AS d
+                )
+                UPDATE inventory i
+                SET current_stock = i.current_stock + c.d,
+                    updated_at = CURRENT_TIMESTAMP
+                FROM changes c
+                WHERE i.item_id = c.item_id AND c.d <> 0;
+            """)
+            conn.execute(upd, {"ids": deltas["item_id"].tolist(), "ds": deltas["delta"].tolist()})
+            out["inventory_update"] = {"items_updated": int(deltas.shape[0])}
+        else:
+            out["inventory_update"] = {"items_updated": 0}
+
+    out["total_ms"] = (time.perf_counter() - t0) * 1000
+    return out
+
+
+# ───────────────────────── convenience wrappers (optional) ───────────────────────── #
 
 @run_transaction
 def bulk_insert_purchases(conn, *, df: pd.DataFrame, schema: str = "public") -> Dict[str, Any]:
-    return bulk_insert_exact_headers(conn, df=df, table="purchases", schema=schema)
+    return _bulk_insert_core(conn, df=df, table="purchases", schema=schema)
 
 @run_transaction
 def bulk_insert_sales(conn, *, df: pd.DataFrame, schema: str = "public") -> Dict[str, Any]:
-    return bulk_insert_exact_headers(conn, df=df, table="sales", schema=schema)
+    return _bulk_insert_core(conn, df=df, table="sales", schema=schema)
 
 
-# Back-compat alias for older imports (`upsert_dataframe(df=..., table=...)`)
+# Back-compat alias (inventory upload code may import this)
 @run_transaction
 def upsert_dataframe(conn, *, df: pd.DataFrame, table: str, schema: str = "public") -> Dict[str, Any]:
-    return bulk_insert_exact_headers(conn, df=df, table=table, schema=schema)
+    return _bulk_insert_core(conn, df=df, table=table, schema=schema)
