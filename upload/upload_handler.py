@@ -317,12 +317,17 @@ def bulk_insert_inventory_skip_conflicts(
     # 6) Validate NOT NULLs presence
     missing_required = [c for c in notnull_cols if c not in used_cols]
     if missing_required:
-        raise ValueError("Your file is missing required non-nullable columns: " + ", ".join(missing_required))
+        raise ValueError(
+            "Your file is missing required non-nullable columns: "
+            + ", ".join(missing_required)
+        )
+    
     where_clause = " AND ".join([f't."{c}" IS NOT NULL' for c in notnull_cols]) if notnull_cols else "TRUE"
-
-    # Count valid rows
+    
+    # ⬇️ FIX: use the SAME transaction/connection (conn.execute), not fetch_dataframe
     t = time.perf_counter()
-    valid_rows = int(fetch_dataframe(f'SELECT COUNT(*) FROM {tmp_quoted} t WHERE {where_clause}').iloc[0, 0])
+    res = conn.execute(text(f'SELECT COUNT(*) FROM {tmp_quoted} t WHERE {where_clause}'))
+    valid_rows = int(res.scalar() or 0)
     timings["count_valid_ms"] = (time.perf_counter() - t) * 1000
 
     # 7) Merge with ON CONFLICT DO NOTHING (skip any unique conflicts)
