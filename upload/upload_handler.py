@@ -7,9 +7,9 @@
 # - Prices hardened:
 #     * Missing/blank sale_price or purchase_price → 0 (counted)
 #     * Any numeric column NaN at COPY time → 0 (prevents NULLs in CSV)
-# - NEW in v2.8:
-#     * bulk_insert_unified_txns(..., update_inventory: bool) → optionally
-#       skip inventory stock updates (insert-only mode) but return delta preview.
+# - Inventory delta UPDATE uses raw psycopg2 (%s placeholders) with a VALUES fallback.
+# - NEW: bulk_insert_inventory_skip_conflicts() → fast staging COPY and
+#        INSERT ... ON CONFLICT (item_name,item_barcode) DO NOTHING.
 
 from __future__ import annotations
 
@@ -133,7 +133,7 @@ def _get_raw_psycopg2_connection(sqlalchemy_conn) -> Optional[Any]:
     return psyco if hasattr(psyco, "cursor") else None
 
 def _to_csv_buffer(df: pd.DataFrame) -> io.StringIO:
-    # We write NULLs as '\\N' in CSV (double-backslash to escape in Python).
+    # Write NULLs as '\\N' (escaped) for COPY.
     buf = io.StringIO()
     df.to_csv(buf, index=False, header=False, na_rep='\\N')
     buf.seek(0)
@@ -185,7 +185,6 @@ def _bulk_insert_core(conn, *, df: pd.DataFrame, table: str, schema: str = "publ
     if raw is not None:
         csv_buf = _to_csv_buffer(df2)
         col_list = ", ".join(f'"{c}"' for c in used_cols)
-        # NOTE: In SQL we pass NULL '\\N' (double-backslash inside Python string).
         sql = f'COPY "{schema}"."{table}" ({col_list}) FROM STDIN WITH (FORMAT CSV, NULL \'\\N\')'
         cur = raw.cursor()
         try:
@@ -654,6 +653,115 @@ def bulk_insert_unified_txns(
     out["skipped_summary"] = {**skipped_total, "unknown_bill_type_rows": out["unknown_bill_type_rows"]}
     out["total_ms"] = (time.perf_counter() - t0) * 1000
     return out
+
+
+# ───────────────────────── inventory: COPY with skip duplicates ───────────────────────── #
+
+@run_transaction
+def bulk_insert_inventory_skip_conflicts(
+    conn,
+    *,
+    df: pd.DataFrame,
+    schema: str = "public",
+) -> Dict[str, Any]:
+    """
+    Fast inventory insert that skips existing (item_name, item_barcode) pairs.
+    Strategy:
+      - CREATE TEMP TABLE tmp LIKE inventory
+      - COPY df -> tmp (subset columns supported)
+      - INSERT INTO inventory (...) SELECT ... FROM tmp
+        ON CONFLICT (item_name, item_barcode) DO NOTHING
+    Returns: {"staged": N, "inserted": M, "skipped_duplicates": N-M, "timings": {...}}
+    """
+    timings: Dict[str, float] = {}
+    t0 = time.perf_counter()
+
+    # 1) Fetch table columns & numeric types for coercion + subset mapping
+    t = time.perf_counter()
+    db_cols = _get_table_columns_ordered(conn, "inventory", schema)
+    int_cols = _get_integer_columns(conn, "inventory", schema)
+    num_cols = _get_numeric_columns(conn, "inventory", schema)
+    timings["fetch_columns_ms"] = (time.perf_counter() - t) * 1000
+
+    # 2) Drop empty rows, align to subset (strict, case-insensitive), rename to DB casing
+    t = time.perf_counter()
+    df = df.dropna(how="all")
+    if df.empty:
+        raise ValueError("No data rows found.")
+    used_cols = _align_subset_columns(df, db_cols)
+    lower2db = {c.lower(): c for c in db_cols}
+    present_lower = {c.lower() for c in used_cols}
+    df2 = df[[c for c in df.columns if c.lower() in present_lower]].copy()
+    df2.rename(columns={c: lower2db[c.lower()] for c in df2.columns}, inplace=True)
+    df2 = df2[used_cols]
+    timings["align_columns_ms"] = (time.perf_counter() - t) * 1000
+
+    # 3) Coerce numeric columns (fillna(0) for numeric, Int64 for integers)
+    t = time.perf_counter()
+    present_int = [c for c in used_cols if c in int_cols]
+    present_num = [c for c in used_cols if c in num_cols]
+    if present_int:
+        _coerce_numeric_like(df2, present_int, as_int=True)
+    if present_num:
+        _coerce_numeric_like(df2, present_num, as_int=False)
+    timings["numeric_coercion_ms"] = (time.perf_counter() - t) * 1000
+
+    staged_rows = len(df2)
+
+    # 4) Create TEMP staging table and COPY into it
+    t = time.perf_counter()
+    tmp_name = f"tmp_inv_{int(time.time()*1000)}"
+    fq_tmp = f'"{schema}"."{tmp_name}"'
+    fq_inv = f'"{schema}"."inventory"'
+    conn.execute(text(f'CREATE TEMP TABLE {fq_tmp} (LIKE {fq_inv} INCLUDING DEFAULTS) ON COMMIT DROP;'))
+
+    # COPY only the used subset of columns
+    raw = _get_raw_psycopg2_connection(conn)
+    used_copy = False
+    if raw is not None:
+        csv_buf = _to_csv_buffer(df2)
+        col_list = ", ".join(f'"{c}"' for c in used_cols)
+        sql_copy = f'COPY {fq_tmp} ({col_list}) FROM STDIN WITH (FORMAT CSV, NULL \'\\N\')'
+        cur = raw.cursor()
+        try:
+            cur.copy_expert(sql=sql_copy, file=csv_buf)
+            used_copy = True
+        finally:
+            cur.close()
+
+    # Fallback executemany if COPY unavailable
+    if not used_copy:
+        placeholders = ", ".join([f":{c}" for c in used_cols])
+        ins_tmp = text(f'INSERT INTO {fq_tmp} ({", ".join(used_cols)}) VALUES ({placeholders})')
+        payload = df2.where(pd.notnull(df2), None).to_dict(orient="records")
+        conn.execute(ins_tmp, payload)
+
+    timings["stage_copy_or_insert_ms"] = (time.perf_counter() - t) * 1000
+
+    # 5) Merge into inventory with ON CONFLICT DO NOTHING
+    # (Skip duplicates on (item_name, item_barcode))
+    t = time.perf_counter()
+    col_list = ", ".join(f'"{c}"' for c in used_cols)
+    sql_merge = f"""
+        INSERT INTO {fq_inv} ({col_list})
+        SELECT {col_list} FROM {fq_tmp}
+        ON CONFLICT ("item_name","item_barcode") DO NOTHING;
+    """
+    res = conn.execute(text(sql_merge))
+    inserted = res.rowcount if res is not None and res.rowcount is not None else 0
+    timings["merge_ms"] = (time.perf_counter() - t) * 1000
+
+    # 6) Done
+    timings["total_ms"] = (time.perf_counter() - t0) * 1000
+    return {
+        "staged": staged_rows,
+        "inserted": int(inserted),
+        "skipped_duplicates": int(staged_rows - inserted),
+        "used_copy": used_copy,
+        "used_columns": used_cols,
+        "timings": timings,
+        "temp_table": tmp_name,
+    }
 
 
 # ───────────────────────── convenience wrappers ───────────────────────── #
