@@ -1,4 +1,4 @@
-# upload_handler.py – FAST v2.9
+# upload_handler.py – FAST v2.9.1
 # - COPY-based bulk insert (subset headers, numeric coercion)
 # - Inventory uploader with skip-duplicates: stage -> merge (ON CONFLICT DO NOTHING)
 # - Unified purchases/sales flow with:
@@ -218,6 +218,7 @@ def get_row_count(table: str, schema: str = "public") -> int:
 
 
 # ───────────────────────── inventory: COPY with skip duplicates ───────────────────────── #
+# FIX: temp table must NOT be schema-qualified. Create as TEMP "tmp_..." only.
 
 @run_transaction
 def bulk_insert_inventory_skip_conflicts(
@@ -227,12 +228,12 @@ def bulk_insert_inventory_skip_conflicts(
     schema: str = "public",
 ) -> Dict[str, Any]:
     """
-    Fast inventory insert that skips existing (item_name, item_barcode) pairs.
+    Fast inventory insert that skips existing unique conflicts.
     Strategy:
-      - CREATE TEMP TABLE tmp LIKE inventory
+      - CREATE TEMP TABLE tmp LIKE public.inventory
       - COPY df -> tmp (subset columns supported)
-      - INSERT INTO inventory (...) SELECT ... FROM tmp
-        ON CONFLICT (item_name, item_barcode) DO NOTHING
+      - INSERT INTO public.inventory (...) SELECT ... FROM tmp
+        ON CONFLICT DO NOTHING  (skip conflicts on any unique constraint)
     Returns: {"staged": N, "inserted": M, "skipped_duplicates": N-M, "timings": {...}}
     """
     timings: Dict[str, float] = {}
@@ -270,12 +271,12 @@ def bulk_insert_inventory_skip_conflicts(
 
     staged_rows = len(df2)
 
-    # 4) Create TEMP staging table and COPY into it
+    # 4) Create TEMP staging table (UNQUALIFIED!) and COPY into it
     t = time.perf_counter()
-    tmp_name = f"tmp_inv_{int(time.time()*1000)}"
-    fq_tmp = f'"{schema}"."{tmp_name}"'
+    tmp_name = f'tmp_inv_{int(time.time()*1000)}'
+    tmp_quoted = f'"{tmp_name}"'
     fq_inv = f'"{schema}"."inventory"'
-    conn.execute(text(f'CREATE TEMP TABLE {fq_tmp} (LIKE {fq_inv} INCLUDING DEFAULTS) ON COMMIT DROP;'))
+    conn.execute(text(f'CREATE TEMP TABLE {tmp_quoted} (LIKE {fq_inv} INCLUDING DEFAULTS) ON COMMIT DROP;'))
 
     # COPY only the used subset of columns
     raw = _get_raw_psycopg2_connection(conn)
@@ -283,7 +284,7 @@ def bulk_insert_inventory_skip_conflicts(
     if raw is not None:
         csv_buf = _to_csv_buffer(df2)
         col_list = ", ".join(f'"{c}"' for c in used_cols)
-        sql_copy = f'COPY {fq_tmp} ({col_list}) FROM STDIN WITH (FORMAT CSV, NULL \'\\N\')'
+        sql_copy = f'COPY {tmp_quoted} ({col_list}) FROM STDIN WITH (FORMAT CSV, NULL \'\\N\')'
         cur = raw.cursor()
         try:
             cur.copy_expert(sql=sql_copy, file=csv_buf)
@@ -294,19 +295,19 @@ def bulk_insert_inventory_skip_conflicts(
     # Fallback executemany if COPY unavailable
     if not used_copy:
         placeholders = ", ".join([f":{c}" for c in used_cols])
-        ins_tmp = text(f'INSERT INTO {fq_tmp} ({", ".join(used_cols)}) VALUES ({placeholders})')
+        ins_tmp = text(f'INSERT INTO {tmp_quoted} ({", ".join(used_cols)}) VALUES ({placeholders})')
         payload = df2.where(pd.notnull(df2), None).to_dict(orient="records")
         conn.execute(ins_tmp, payload)
 
     timings["stage_copy_or_insert_ms"] = (time.perf_counter() - t) * 1000
 
-    # 5) Merge into inventory with ON CONFLICT DO NOTHING
+    # 5) Merge into inventory with ON CONFLICT DO NOTHING (skip any unique conflicts)
     t = time.perf_counter()
     col_list = ", ".join(f'"{c}"' for c in used_cols)
     sql_merge = f"""
         INSERT INTO {fq_inv} ({col_list})
-        SELECT {col_list} FROM {fq_tmp}
-        ON CONFLICT ("item_name","item_barcode") DO NOTHING;
+        SELECT {col_list} FROM {tmp_quoted}
+        ON CONFLICT DO NOTHING;
     """
     res = conn.execute(text(sql_merge))
     inserted = res.rowcount if res is not None and res.rowcount is not None else 0
@@ -596,6 +597,8 @@ def _filter_to_table_columns(conn, df: pd.DataFrame, table: str, schema: str = "
         raise ValueError(f"No valid columns to insert into {schema}.{table}.")
     return df[keep]
 
+
+# ───────────────────────── unified Purchases/Sales (insert + optional inv update) ───────────────────────── #
 
 @run_transaction
 def bulk_insert_unified_txns(
