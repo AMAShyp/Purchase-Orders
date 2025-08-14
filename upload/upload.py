@@ -1,7 +1,4 @@
-# upload.py – Inventory uploader (fast COPY, skip duplicates)
-# - Inserts via staging TEMP table -> ON CONFLICT DO NOTHING (skip duplicates)
-# - Subset headers allowed; DB-managed columns (item_id/created_at/updated_at) are not required
-
+# upload.py – Inventory uploader (fast COPY, NULL-tolerant staging, skip duplicates)
 from __future__ import annotations
 
 import pandas as pd
@@ -30,7 +27,6 @@ INVENTORY_TEMPLATE_COLS: List[str] = [
     "current_stock",
 ]
 
-# ---------- file I/O ----------
 def _read_file(file) -> pd.DataFrame:
     if file.type == "text/csv":
         return pd.read_csv(StringIO(file.getvalue().decode("utf-8")))
@@ -50,10 +46,9 @@ def _arrow_preview(df: pd.DataFrame) -> pd.DataFrame:
     return prev
 
 
-# ---------- PAGE ----------
 def page():
-    st.title("⬆️ Inventory Upload (skip duplicates)")
-    st.caption("If a row conflicts with any UNIQUE constraint, it will be skipped (no error).")
+    st.title("⬆️ Inventory Upload (NULL-tolerant, skip duplicates)")
+    st.caption("We stage to a TEMP table (all columns nullable), insert only valid rows into `inventory`, and skip duplicates.")
 
     st.download_button(
         "📄 Download Excel template",
@@ -67,7 +62,7 @@ def page():
         "Choose CSV or Excel for inventory",
         key="inventory_uploader",
         type=["csv", "xlsx", "xls"],
-        help="Headers must match real columns (subset allowed). Do not include item_id/created_at/updated_at.",
+        help="Headers must be real column names (subset allowed). Do not include item_id/created_at/updated_at.",
     )
     if file is None:
         st.info("No file selected yet.")
@@ -79,16 +74,17 @@ def page():
     st.dataframe(_arrow_preview(df.head(250)), use_container_width=True, height=300)
 
     if st.button("✅ Commit to DB", key="commit_inventory", type="primary"):
-        with st.spinner("Staging and inserting (skipping duplicates)…"):
+        with st.spinner("Staging and inserting (NULL-tolerant, skipping duplicates)…"):
             try:
                 result = bulk_insert_inventory_skip_conflicts(df=df)
                 st.success("✅ Inventory upload finished.")
-                st.write(
-                    f"Staged: **{result['staged']}**, "
-                    f"Inserted: **{result['inserted']}**, "
-                    f"Skipped as duplicates: **{result['skipped_duplicates']}** "
-                    f"(via {'COPY' if result.get('used_copy') else 'executemany'})"
+                msg = (
+                    f"Staged: **{result['staged']}** · "
+                    f"Inserted: **{result['inserted']}** · "
+                    f"Skipped (NULL required): **{result.get('skipped_null_required', 0)}** · "
+                    f"Skipped (duplicates): **{result.get('skipped_duplicates', 0)}**"
                 )
+                st.write(msg)
                 if "used_columns" in result:
                     st.write("Used columns:", ", ".join(result["used_columns"]))
                 with st.expander("Timing (ms)"):
@@ -99,17 +95,4 @@ def page():
                     count_df = fetch_dataframe('SELECT COUNT(*) AS total FROM "public"."inventory";')
                     st.info(f"📊 Table `inventory` now has **{int(count_df['total'].iloc[0])}** total rows.")
                     st.write("Last 5 rows by item_id:")
-                    last_rows = fetch_dataframe('SELECT * FROM "public"."inventory" ORDER BY item_id DESC LIMIT 5;')
-                    st.dataframe(last_rows, use_container_width=True, height=220)
-                except Exception as dbg_err:
-                    st.warning(f"Post-insert debug query failed: {dbg_err}")
-
-            except Exception as exc:
-                st.error(f"❌ Upload failed → {exc}")
-
-    st.divider()
-
-
-if __name__ == "__main__":
-    st.set_page_config(page_title="Inventory Upload", page_icon="⬆️", layout="wide")
-    page()
+                    last_rows = fet_
