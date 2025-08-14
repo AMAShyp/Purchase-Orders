@@ -1,4 +1,4 @@
-# upload_handler.py – FAST v2.6
+# upload_handler.py – FAST v2.6.1
 # - COPY-based bulk insert (subset headers, numeric coercion)
 # - Unified purchases/sales flow with:
 #     * input_quantity / output_quantity → single DB quantity
@@ -6,7 +6,7 @@
 #     * continue-on-error (skip unfixable), end summary of repairs/skips
 # - Prices hardened:
 #     * Missing/blank sale_price or purchase_price → 0 (counted)
-#     * Any numeric column NaN at COPY time → 0 (prevents \N in CSV)
+#     * Any numeric column NaN at COPY time → 0 (prevents NULLs in CSV)
 
 from __future__ import annotations
 
@@ -97,7 +97,7 @@ def _coerce_numeric_like(df: pd.DataFrame, cols: List[str], as_int: bool) -> Non
       - Strip commas/spaces from strings
       - to_numeric(errors='coerce')
       - If integer-target: round + fillna(0) + Int64 dtype
-      - If numeric-target: fillna(0) (prevents \N in COPY)
+      - If numeric-target: fillna(0) (ensures 0 instead of NULL for COPY)
     """
     for c in cols:
         if c not in df.columns:
@@ -113,7 +113,7 @@ def _coerce_numeric_like(df: pd.DataFrame, cols: List[str], as_int: bool) -> Non
         if as_int:
             df[c] = num.fillna(0).round(0).astype("Int64")
         else:
-            # IMPORTANT: fillna(0) for numeric columns so COPY never sees \N
+            # IMPORTANT: fillna(0) for numeric columns so COPY never sees NULL
             df[c] = num.fillna(0)
 
 
@@ -127,7 +127,7 @@ def _get_raw_psycopg2_connection(sqlalchemy_conn) -> Optional[Any]:
     return psyco if hasattr(psyco, "cursor") else None
 
 def _to_csv_buffer(df: pd.DataFrame) -> io.StringIO:
-    # Write NULLs as \N (escaped for Python). We minimize NULLs via numeric fillna(0).
+    # We write NULLs as '\\N' in CSV (double-backslash to escape in Python).
     buf = io.StringIO()
     df.to_csv(buf, index=False, header=False, na_rep='\\N')
     buf.seek(0)
@@ -179,6 +179,7 @@ def _bulk_insert_core(conn, *, df: pd.DataFrame, table: str, schema: str = "publ
     if raw is not None:
         csv_buf = _to_csv_buffer(df2)
         col_list = ", ".join(f'"{c}"' for c in used_cols)
+        # NOTE: In SQL we pass NULL '\\N' (double-backslash inside Python string).
         sql = f'COPY "{schema}"."{table}" ({col_list}) FROM STDIN WITH (FORMAT CSV, NULL \'\\N\')'
         cur = raw.cursor()
         try:
@@ -309,7 +310,6 @@ def _resolve_item_ids_and_create(
         "mismatch_preferred_barcode": 0,
         "mismatch_preferred_name": 0,
         "created_new_items": 0,
-        # counters for price defaults are added in bulk_insert_unified_txns
     }
     skipped: Dict[str, int] = {"skipped_missing_pair": 0, "skipped_unknown_item": 0}
 
