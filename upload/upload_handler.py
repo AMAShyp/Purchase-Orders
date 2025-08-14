@@ -1,18 +1,11 @@
-# upload_handler.py – FAST v2.3
+# upload_handler.py – FAST v2.4
 # - COPY-based bulk insert (subset headers, numeric coercion)
 # - Unified purchases/sales flow with:
 #     * input_quantity / output_quantity → single DB quantity
-#     * strict pair matching on (item_name, item_barcode)
-#     * REPAIR MODE:
-#         - Fill missing side (name/barcode) when safe
-#         - If stored side differs, update to new value when safe (no conflicting pair)
-#         - If both sides exist but point to different items, DO NOT STOP:
-#             resolve by policy (default: prefer barcode) and continue
-#     * Create items on positive purchases if pair is new
-#     * Skip unfixable rows (e.g., missing name/barcode), with counts
-#     * End-to-end summary of repairs / skips / conflicts
-#
-# All DB writes occur in one transaction via @run_transaction.
+#     * pair matching on (item_name, item_barcode) with repair mode
+#     * continue-on-error (skip unfixable), end summary of repairs/skips
+# - NEW in v2.4: filter unified frames to the target table's columns before COPY
+#   (prevents "Unknown columns in file" errors for helper columns).
 
 from __future__ import annotations
 
@@ -86,6 +79,10 @@ def get_insertable_columns(table: str, schema: str = "public") -> List[str]:
 _num_clean_re = re.compile(r"[,\s]")
 
 def _align_subset_columns(df: pd.DataFrame, db_cols: List[str]) -> List[str]:
+    """
+    Strict: every column in df must exist in the table.
+    Returns the DB-ordered subset used for insertion.
+    """
     db_lower_map = {c.lower(): c for c in db_cols}
     file_lowers = [c.lower() for c in df.columns]
     extra = [c for c in df.columns if c.lower() not in db_lower_map]
@@ -122,6 +119,7 @@ def _get_raw_psycopg2_connection(sqlalchemy_conn) -> Optional[Any]:
     return psyco if hasattr(psyco, "cursor") else None
 
 def _to_csv_buffer(df: pd.DataFrame) -> io.StringIO:
+    # write NULLs as \N (escaped for Python)
     buf = io.StringIO()
     df.to_csv(buf, index=False, header=False, na_rep='\\N')
     buf.seek(0)
@@ -141,7 +139,7 @@ def _bulk_insert_core(conn, *, df: pd.DataFrame, table: str, schema: str = "publ
     num_cols = _get_numeric_columns(conn, table, schema)
     timings["fetch_columns_ms"] = (time.perf_counter() - t) * 1000
 
-    # Align subset
+    # Align subset (strict)
     t = time.perf_counter()
     df = df.dropna(how="all")
     if df.empty:
@@ -209,17 +207,8 @@ def get_row_count(table: str, schema: str = "public") -> int:
 
 # ───────────────────────── unified Purchases/Sales flow ───────────────────────── #
 
-SALE_TYPES = {
-    "sales invoice",
-    "sales return invoice",
-}
-PURCHASE_TYPES = {
-    "purchase invoice direct",
-    "purchasing return invoice",
-    # aliases
-    "purchase invoice",
-    "purchase return invoice",
-}
+SALE_TYPES = {"sales invoice", "sales return invoice"}
+PURCHASE_TYPES = {"purchase invoice direct", "purchasing return invoice", "purchase invoice", "purchase return invoice"}
 
 INPUT_QTY_TYPES = {"purchase invoice direct", "purchase invoice", "sales return invoice"}
 OUTPUT_QTY_TYPES = {"sales invoice", "purchasing return invoice", "purchase return invoice"}
@@ -258,6 +247,8 @@ def _derive_quantity_from_io(df: pd.DataFrame) -> pd.DataFrame:
     return df2
 
 
+# ─────────────── Strict pair matching + REPAIR + CONTINUE ─────────────── #
+
 def _resolve_item_ids_and_create(
     conn,
     df: pd.DataFrame,
@@ -267,16 +258,11 @@ def _resolve_item_ids_and_create(
     mismatch_policy: Literal["prefer_barcode", "prefer_name"] = "prefer_barcode",
 ) -> Tuple[pd.DataFrame, Dict[int, int], Dict[str, int], Dict[str, int]]:
     """
-    STRICT pair matching with REPAIRS and CONTINUE-on-error:
-      - Each row SHOULD have both item_name and item_barcode; if missing → skipped.
-      - Exact pair → use it.
-      - If one side exists & other missing in DB → repair (fill) when safe.
-      - If one side exists with DIFFERENT stored value:
-          * If changing to new value is safe (no conflicting pair), UPDATE and count 'barcode_changed' / 'name_changed'.
-          * If NOT safe (conflict), resolve row by mismatch_policy without failing.
-      - Neither exists → create ONLY for positive purchases; otherwise skip.
+    Resolve 'item_id' for each row using (item_name, item_barcode).
+    - Repairs missing or outdated pairs when safe.
+    - Continues past unfixable rows (they are skipped).
     Returns:
-      (resolved_df, created_map, repairs_summary_counts, skipped_summary_counts)
+      resolved_df, created_map, repairs_summary, skipped_summary
     """
     df2 = df.copy()
 
@@ -285,7 +271,6 @@ def _resolve_item_ids_and_create(
     df2["item_barcode"] = df2.get("item_barcode", pd.Series([], dtype="object")).map(lambda v: str(v or "").strip())
     df2["bill_type"] = df2.get("bill_type", pd.Series([], dtype="object")).map(lambda v: str(v or "").strip().lower())
 
-    # Stats
     repairs: Dict[str, int] = {
         "filled_missing_barcode": 0,
         "filled_missing_name": 0,
@@ -295,12 +280,8 @@ def _resolve_item_ids_and_create(
         "mismatch_preferred_name": 0,
         "created_new_items": 0,
     }
-    skipped: Dict[str, int] = {
-        "skipped_missing_pair": 0,
-        "skipped_unknown_item": 0,
-    }
+    skipped: Dict[str, int] = {"skipped_missing_pair": 0, "skipped_unknown_item": 0}
 
-    # Prepare maps from current inventory
     names = set(df2["item_name"])
     barcodes = set(df2["item_barcode"])
 
@@ -346,12 +327,12 @@ def _resolve_item_ids_and_create(
         bc = row["item_barcode"]
         bt = row["bill_type"]
 
-        # Require both fields; skip if missing
+        # require both; skip if missing
         if nm == "" or bc == "":
             skipped["skipped_missing_pair"] += 1
             continue
 
-        # 1) Exact (name, barcode) pair exists → OK
+        # exact pair
         if (nm, bc) in pair_map:
             df2.at[idx, "item_id"] = int(pair_map[(nm, bc)])
             kept_rows.append(idx)
@@ -360,7 +341,7 @@ def _resolve_item_ids_and_create(
         name_hit = name_map.get(nm)  # (iid, stored_bc)
         code_hit = code_map.get(bc)  # (iid, stored_nm)
 
-        # 2) Both exist separately but different ids → resolve by policy (no DB change)
+        # both exist but different ids → resolve by policy
         if name_hit and code_hit and name_hit[0] != code_hit[0]:
             if mismatch_policy == "prefer_barcode":
                 df2.at[idx, "item_id"] = int(code_hit[0])
@@ -371,100 +352,74 @@ def _resolve_item_ids_and_create(
             kept_rows.append(idx)
             continue
 
-        # 3) name exists; code unknown OR different-from-stored
+        # name exists; barcode unknown/different
         if name_hit and not code_hit:
             iid, stored_bc = name_hit
-            if stored_bc is None or stored_bc == "":
-                # Fill missing barcode
-                upd = text("""
-                    UPDATE inventory
-                    SET item_barcode = :bc, updated_at = CURRENT_TIMESTAMP
+            if (stored_bc is None) or (stored_bc == ""):
+                # fill missing barcode
+                conn.execute(text("""
+                    UPDATE inventory SET item_barcode = :bc, updated_at = CURRENT_TIMESTAMP
                     WHERE item_id = :iid
-                """)
-                conn.execute(upd, {"bc": bc, "iid": iid})
+                """), {"bc": bc, "iid": iid})
                 name_map[nm] = (iid, bc); code_map[bc] = (iid, nm); pair_map[(nm, bc)] = iid
                 repairs["filled_missing_barcode"] += 1
-                df2.at[idx, "item_id"] = int(iid)
-                kept_rows.append(idx)
-                continue
+                df2.at[idx, "item_id"] = int(iid); kept_rows.append(idx); continue
             if stored_bc != bc:
-                # If no one owns the new barcode, change it on this item (safe)
+                # change to new barcode if safe
                 if bc not in code_map and (nm, bc) not in pair_map:
-                    upd = text("""
-                        UPDATE inventory
-                        SET item_barcode = :bc, updated_at = CURRENT_TIMESTAMP
+                    conn.execute(text("""
+                        UPDATE inventory SET item_barcode = :bc, updated_at = CURRENT_TIMESTAMP
                         WHERE item_id = :iid
-                    """)
-                    conn.execute(upd, {"bc": bc, "iid": iid})
-                    # update maps
-                    # remove old code if present
+                    """), {"bc": bc, "iid": iid})
                     if stored_bc in code_map:
                         del code_map[stored_bc]
                     name_map[nm] = (iid, bc); code_map[bc] = (iid, nm); pair_map[(nm, bc)] = iid
                     repairs["barcode_changed"] += 1
-                    df2.at[idx, "item_id"] = int(iid)
-                    kept_rows.append(idx)
-                    continue
-                # otherwise prefer policy without DB change
+                    df2.at[idx, "item_id"] = int(iid); kept_rows.append(idx); continue
+                # prefer policy without DB change
                 if mismatch_policy == "prefer_barcode" and bc in code_map:
-                    df2.at[idx, "item_id"] = int(code_map[bc][0])
-                    repairs["mismatch_preferred_barcode"] += 1
+                    df2.at[idx, "item_id"] = int(code_map[bc][0]); repairs["mismatch_preferred_barcode"] += 1
                 else:
-                    df2.at[idx, "item_id"] = int(iid)
-                    repairs["mismatch_preferred_name"] += 1
-                kept_rows.append(idx)
-                continue
+                    df2.at[idx, "item_id"] = int(iid); repairs["mismatch_preferred_name"] += 1
+                kept_rows.append(idx); continue
 
-        # 4) code exists; name unknown OR different-from-stored
+        # barcode exists; name unknown/different
         if code_hit and not name_hit:
             iid, stored_nm = code_hit
-            if stored_nm is None or stored_nm == "":
-                upd = text("""
-                    UPDATE inventory
-                    SET item_name = :nm, updated_at = CURRENT_TIMESTAMP
+            if (stored_nm is None) or (stored_nm == ""):
+                conn.execute(text("""
+                    UPDATE inventory SET item_name = :nm, updated_at = CURRENT_TIMESTAMP
                     WHERE item_id = :iid
-                """)
-                conn.execute(upd, {"nm": nm, "iid": iid})
+                """), {"nm": nm, "iid": iid})
                 code_map[bc] = (iid, nm); name_map[nm] = (iid, bc); pair_map[(nm, bc)] = iid
                 repairs["filled_missing_name"] += 1
-                df2.at[idx, "item_id"] = int(iid)
-                kept_rows.append(idx)
-                continue
+                df2.at[idx, "item_id"] = int(iid); kept_rows.append(idx); continue
             if stored_nm != nm:
                 if nm not in name_map and (nm, bc) not in pair_map:
-                    upd = text("""
-                        UPDATE inventory
-                        SET item_name = :nm, updated_at = CURRENT_TIMESTAMP
+                    conn.execute(text("""
+                        UPDATE inventory SET item_name = :nm, updated_at = CURRENT_TIMESTAMP
                         WHERE item_id = :iid
-                    """)
-                    conn.execute(upd, {"nm": nm, "iid": iid})
+                    """), {"nm": nm, "iid": iid})
                     if stored_nm in name_map:
                         del name_map[stored_nm]
                     code_map[bc] = (iid, nm); name_map[nm] = (iid, bc); pair_map[(nm, bc)] = iid
                     repairs["name_changed"] += 1
-                    df2.at[idx, "item_id"] = int(iid)
-                    kept_rows.append(idx)
-                    continue
-                # prefer policy
+                    df2.at[idx, "item_id"] = int(iid); kept_rows.append(idx); continue
                 if mismatch_policy == "prefer_barcode":
-                    df2.at[idx, "item_id"] = int(iid)
-                    repairs["mismatch_preferred_barcode"] += 1
+                    df2.at[idx, "item_id"] = int(iid); repairs["mismatch_preferred_barcode"] += 1
                 else:
-                    # choose the other if present
                     df2.at[idx, "item_id"] = int(name_map[nm][0]) if nm in name_map else int(iid)
                     repairs["mismatch_preferred_name"] += 1
-                kept_rows.append(idx)
-                continue
+                kept_rows.append(idx); continue
 
-        # 5) Neither exists → create only for positive purchases
+        # neither exists → create only for positive purchases
         is_positive_purchase = bt in ("purchase invoice direct", "purchase invoice")
         if allow_create_positive_purchases and is_positive_purchase:
-            ins = text("""
+            item_id_new = conn.execute(text("""
                 INSERT INTO inventory (item_name, item_barcode, category, unit, initial_stock, current_stock)
                 VALUES (:name, :code, :cat, :unit, 0, 0)
                 RETURNING item_id;
-            """)
-            item_id_new = conn.execute(ins, {
+            """), {
                 "name": nm,
                 "code": bc,
                 "cat":  (str(row.get("category") or "Uncategorized").strip()),
@@ -473,13 +428,10 @@ def _resolve_item_ids_and_create(
             iid = int(item_id_new)
             name_map[nm] = (iid, bc); code_map[bc] = (iid, nm); pair_map[(nm, bc)] = iid
             repairs["created_new_items"] += 1
-            df2.at[idx, "item_id"] = int(iid)
-            kept_rows.append(idx)
-            continue
+            df2.at[idx, "item_id"] = int(iid); kept_rows.append(idx); continue
 
         # otherwise skip
         skipped["skipped_unknown_item"] += 1
-        continue
 
     resolved = df2.loc[kept_rows].copy()
     if not resolved.empty:
@@ -497,6 +449,16 @@ def _aggregate_deltas(df: pd.DataFrame) -> pd.DataFrame:
     return agg
 
 
+# NEW: keep only columns that exist in the destination table
+def _filter_to_table_columns(conn, df: pd.DataFrame, table: str, schema: str = "public") -> pd.DataFrame:
+    db_cols = _get_table_columns_ordered(conn, table, schema)
+    db_lower = {c.lower() for c in db_cols}
+    keep = [c for c in df.columns if c.lower() in db_lower]
+    if not keep:
+        raise ValueError(f"No valid columns to insert into {schema}.{table}.")
+    return df[keep]
+
+
 @run_transaction
 def bulk_insert_unified_txns(
     conn,
@@ -507,7 +469,7 @@ def bulk_insert_unified_txns(
 ) -> Dict[str, Any]:
     """
     Unified purchases/sales upload with input/output quantity support + repair mode.
-    Continues past bad rows; returns detailed summary.
+    Continues past bad rows; returns detailed summary. Filters helper columns before COPY.
     """
     t0 = time.perf_counter()
     out: Dict[str, Any] = {
@@ -527,7 +489,7 @@ def bulk_insert_unified_txns(
     base["bill_type"] = _normalize_bill_type(base.get("bill_type", pd.Series([], dtype="object")))
     base = _derive_quantity_from_io(base)
 
-    # Route by bill_type (do not fail; count unknown and drop)
+    # Route by bill_type (count & drop unknown)
     is_sale = base["bill_type"].isin(SALE_TYPES)
     is_purchase = base["bill_type"].isin(PURCHASE_TYPES)
     unknown_mask = ~(is_sale | is_purchase)
@@ -537,12 +499,17 @@ def bulk_insert_unified_txns(
     purchases_raw = base[base["bill_type"].isin(PURCHASE_TYPES)].copy()
     sales_raw = base[base["bill_type"].isin(SALE_TYPES)].copy()
 
-    repairs_total = {"filled_missing_barcode":0,"filled_missing_name":0,"barcode_changed":0,"name_changed":0,
-                     "mismatch_preferred_barcode":0,"mismatch_preferred_name":0,"created_new_items":0}
-    skipped_total = {"skipped_missing_pair":0,"skipped_unknown_item":0}
+    repairs_total = {
+        "filled_missing_barcode": 0, "filled_missing_name": 0,
+        "barcode_changed": 0, "name_changed": 0,
+        "mismatch_preferred_barcode": 0, "mismatch_preferred_name": 0,
+        "created_new_items": 0
+    }
+    skipped_total = {"skipped_missing_pair": 0, "skipped_unknown_item": 0}
 
     # Purchases
     purchases_resolved = pd.DataFrame()
+    purchases_insert = pd.DataFrame()
     if not purchases_raw.empty:
         purchases_raw.rename(columns={"txn_date": "purchase_date", "unit_price": "purchase_price"}, inplace=True)
         purchases_resolved, _, repairs_p, skipped_p = _resolve_item_ids_and_create(
@@ -555,10 +522,13 @@ def bulk_insert_unified_txns(
         for k in repairs_total: repairs_total[k] += repairs_p.get(k, 0)
         for k in skipped_total: skipped_total[k] += skipped_p.get(k, 0)
         if not purchases_resolved.empty:
-            out["purchases"] = _bulk_insert_core(conn, df=purchases_resolved, table="purchases", schema=schema)
+            # DROP helper columns before COPY
+            purchases_insert = _filter_to_table_columns(conn, purchases_resolved, "purchases", schema=schema)
+            out["purchases"] = _bulk_insert_core(conn, df=purchases_insert, table="purchases", schema=schema)
 
     # Sales
     sales_resolved = pd.DataFrame()
+    sales_insert = pd.DataFrame()
     if not sales_raw.empty:
         sales_raw.rename(columns={"txn_date": "sale_date", "unit_price": "sale_price"}, inplace=True)
         sales_resolved, _, repairs_s, skipped_s = _resolve_item_ids_and_create(
@@ -571,14 +541,19 @@ def bulk_insert_unified_txns(
         for k in repairs_total: repairs_total[k] += repairs_s.get(k, 0)
         for k in skipped_total: skipped_total[k] += skipped_s.get(k, 0)
         if not sales_resolved.empty:
-            out["sales"] = _bulk_insert_core(conn, df=sales_resolved, table="sales", schema=schema)
+            sales_insert = _filter_to_table_columns(conn, sales_resolved, "sales", schema=schema)
+            out["sales"] = _bulk_insert_core(conn, df=sales_insert, table="sales", schema=schema)
 
-    # Inventory deltas from the *resolved rows we actually inserted*
-    both_for_delta = pd.concat([purchases_resolved, sales_resolved], ignore_index=True)
+    # Inventory deltas from the rows we actually inserted
+    both_for_delta = pd.DataFrame()
+    if not purchases_insert.empty:
+        both_for_delta = pd.concat([both_for_delta, purchases_resolved[["item_id", "quantity", "bill_type"]]])
+    if not sales_insert.empty:
+        both_for_delta = pd.concat([both_for_delta, sales_resolved[["item_id", "quantity", "bill_type"]]])
     if not both_for_delta.empty:
-        deltas = _aggregate_deltas(both_for_delta[["item_id","quantity","bill_type"]])
+        deltas = _aggregate_deltas(both_for_delta)
         if not deltas.empty:
-            upd = text("""
+            conn.execute(text("""
                 WITH changes AS (
                     SELECT UNNEST(:ids::int[]) AS item_id, UNNEST(:ds::int[]) AS d
                 )
@@ -587,8 +562,7 @@ def bulk_insert_unified_txns(
                     updated_at = CURRENT_TIMESTAMP
                 FROM changes c
                 WHERE i.item_id = c.item_id AND c.d <> 0;
-            """)
-            conn.execute(upd, {"ids": deltas["item_id"].tolist(), "ds": deltas["delta"].tolist()})
+            """), {"ids": deltas["item_id"].tolist(), "ds": deltas["delta"].tolist()})
             out["inventory_update"] = {"items_updated": int(deltas.shape[0])}
         else:
             out["inventory_update"] = {"items_updated": 0}
@@ -596,10 +570,7 @@ def bulk_insert_unified_txns(
         out["inventory_update"] = {"items_updated": 0}
 
     out["repairs_summary"] = repairs_total
-    out["skipped_summary"] = {
-        **skipped_total,
-        "unknown_bill_type_rows": out["unknown_bill_type_rows"],
-    }
+    out["skipped_summary"] = {**skipped_total, "unknown_bill_type_rows": out["unknown_bill_type_rows"]}
     out["total_ms"] = (time.perf_counter() - t0) * 1000
     return out
 
