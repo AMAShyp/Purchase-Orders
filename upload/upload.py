@@ -1,8 +1,4 @@
 # upload.py – Inventory uploader (fast COPY, stage -> merge, skip duplicates)
-# - Stages into a TEMP table (all columns nullable), then merges into inventory:
-#   * rows that have NULL in required (NOT NULL) destination columns are skipped and counted
-#   * conflicts on any UNIQUE are skipped via ON CONFLICT DO NOTHING
-# - Subset headers allowed; DB-managed columns (item_id/created_at/updated_at) are not required
 
 from __future__ import annotations
 
@@ -32,7 +28,6 @@ INVENTORY_TEMPLATE_COLS: List[str] = [
     "current_stock",
 ]
 
-# ---------- file I/O ----------
 def _read_file(file) -> pd.DataFrame:
     if file.type == "text/csv":
         return pd.read_csv(StringIO(file.getvalue().decode("utf-8")))
@@ -51,13 +46,11 @@ def _arrow_preview(df: pd.DataFrame) -> pd.DataFrame:
             prev[col] = prev[col].astype(str).where(prev[col].notna(), "")
     return prev
 
-
-# ---------- PAGE ----------
 def page():
     st.title("⬆️ Inventory Upload (stage → merge, skip duplicates)")
     st.caption(
         "Rows with NULLs in required columns (e.g., item_name, unit, initial_stock, current_stock) "
-        "are skipped automatically. Duplicate (item_name/item_barcode) rows are also skipped."
+        "are skipped automatically. Duplicate rows are skipped via ON CONFLICT DO NOTHING."
     )
 
     st.download_button(
@@ -115,7 +108,6 @@ def page():
                 st.error(f"❌ Upload failed → {exc}")
 
     st.divider()
-
 
 if __name__ == "__main__":
     st.set_page_config(page_title="Inventory Upload", page_icon="⬆️", layout="wide")
