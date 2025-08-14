@@ -1,4 +1,9 @@
-# upload.py – Inventory uploader (fast COPY, NULL-tolerant staging, skip duplicates)
+# upload.py – Inventory uploader (fast COPY, stage -> merge, skip duplicates)
+# - Stages into a TEMP table (all columns nullable), then merges into inventory:
+#   * rows that have NULL in required (NOT NULL) destination columns are skipped and counted
+#   * conflicts on any UNIQUE are skipped via ON CONFLICT DO NOTHING
+# - Subset headers allowed; DB-managed columns (item_id/created_at/updated_at) are not required
+
 from __future__ import annotations
 
 import pandas as pd
@@ -27,6 +32,7 @@ INVENTORY_TEMPLATE_COLS: List[str] = [
     "current_stock",
 ]
 
+# ---------- file I/O ----------
 def _read_file(file) -> pd.DataFrame:
     if file.type == "text/csv":
         return pd.read_csv(StringIO(file.getvalue().decode("utf-8")))
@@ -46,9 +52,13 @@ def _arrow_preview(df: pd.DataFrame) -> pd.DataFrame:
     return prev
 
 
+# ---------- PAGE ----------
 def page():
-    st.title("⬆️ Inventory Upload (NULL-tolerant, skip duplicates)")
-    st.caption("We stage to a TEMP table (all columns nullable), insert only valid rows into `inventory`, and skip duplicates.")
+    st.title("⬆️ Inventory Upload (stage → merge, skip duplicates)")
+    st.caption(
+        "Rows with NULLs in required columns (e.g., item_name, unit, initial_stock, current_stock) "
+        "are skipped automatically. Duplicate (item_name/item_barcode) rows are also skipped."
+    )
 
     st.download_button(
         "📄 Download Excel template",
@@ -62,7 +72,7 @@ def page():
         "Choose CSV or Excel for inventory",
         key="inventory_uploader",
         type=["csv", "xlsx", "xls"],
-        help="Headers must be real column names (subset allowed). Do not include item_id/created_at/updated_at.",
+        help="Headers must match real columns (subset allowed). Do not include item_id/created_at/updated_at.",
     )
     if file is None:
         st.info("No file selected yet.")
@@ -74,17 +84,18 @@ def page():
     st.dataframe(_arrow_preview(df.head(250)), use_container_width=True, height=300)
 
     if st.button("✅ Commit to DB", key="commit_inventory", type="primary"):
-        with st.spinner("Staging and inserting (NULL-tolerant, skipping duplicates)…"):
+        with st.spinner("Staging and merging (skipping invalid & duplicates)…"):
             try:
                 result = bulk_insert_inventory_skip_conflicts(df=df)
                 st.success("✅ Inventory upload finished.")
-                msg = (
-                    f"Staged: **{result['staged']}** · "
-                    f"Inserted: **{result['inserted']}** · "
-                    f"Skipped (NULL required): **{result.get('skipped_null_required', 0)}** · "
-                    f"Skipped (duplicates): **{result.get('skipped_duplicates', 0)}**"
+                st.write(
+                    f"Staged: **{result['staged']}**, "
+                    f"Valid for insert: **{result['valid_rows']}**, "
+                    f"Inserted: **{result['inserted']}**, "
+                    f"Skipped (NULL required): **{result['skipped_null_required']}**, "
+                    f"Skipped (duplicates): **{result['skipped_duplicates']}** "
+                    f"(via {'COPY' if result.get('used_copy') else 'executemany'})"
                 )
-                st.write(msg)
                 if "used_columns" in result:
                     st.write("Used columns:", ", ".join(result["used_columns"]))
                 with st.expander("Timing (ms)"):
