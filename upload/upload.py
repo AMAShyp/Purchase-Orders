@@ -10,11 +10,17 @@ import streamlit as st
 from io import StringIO, BytesIO
 from typing import List
 
-# Robust imports (package vs flat)
+# ───────────────────────── Robust imports (package vs flat) ───────────────────────── #
+# When app imports "upload.upload", this file is inside the "upload" package.
+# Use relative import first; fall back to absolute if running flat.
 try:
-    from .upload_handler import bulk_insert_inventory_skip_conflicts
-    from ..db_handler import fetch_dataframe
+    from .upload_handler import bulk_insert_inventory_skip_conflicts  # package-relative
+    try:
+        from ..db_handler import fetch_dataframe  # parent package (if your project is a package)
+    except Exception:
+        from db_handler import fetch_dataframe  # flat fallback (top-level module)
 except Exception:
+    # Flat fallback for both imports
     from upload_handler import bulk_insert_inventory_skip_conflicts
     from db_handler import fetch_dataframe
 
