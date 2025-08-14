@@ -1,7 +1,6 @@
 # upload.py – Inventory uploader (fast COPY, skip duplicates)
-# - Minimal checks: headers must match the inventory table columns you provide
-# - Inserts via staging temp table -> ON CONFLICT DO NOTHING (skip duplicates)
-# - Shows timings + a small post-insert preview
+# - Inserts via staging TEMP table -> ON CONFLICT DO NOTHING (skip duplicates)
+# - Subset headers allowed; DB-managed columns (item_id/created_at/updated_at) are not required
 
 from __future__ import annotations
 
@@ -10,30 +9,25 @@ import streamlit as st
 from io import StringIO, BytesIO
 from typing import List
 
-# ───────────────────────── Robust imports (package vs flat) ───────────────────────── #
-# When app imports "upload.upload", this file is inside the "upload" package.
-# Use relative import first; fall back to absolute if running flat.
+# Robust imports (package vs flat)
 try:
-    from .upload_handler import bulk_insert_inventory_skip_conflicts  # package-relative
+    from .upload_handler import bulk_insert_inventory_skip_conflicts
     try:
-        from ..db_handler import fetch_dataframe  # parent package (if your project is a package)
+        from ..db_handler import fetch_dataframe
     except Exception:
-        from db_handler import fetch_dataframe  # flat fallback (top-level module)
+        from db_handler import fetch_dataframe
 except Exception:
-    # Flat fallback for both imports
     from upload_handler import bulk_insert_inventory_skip_conflicts
     from db_handler import fetch_dataframe
 
 
 INVENTORY_TEMPLATE_COLS: List[str] = [
-    # Provide any subset of real DB columns. Common set below:
     "item_name",
     "item_barcode",
     "category",
     "unit",
     "initial_stock",
     "current_stock",
-    # NOTE: Do NOT include item_id / created_at / updated_at (handled by DB).
 ]
 
 # ---------- file I/O ----------
@@ -59,7 +53,7 @@ def _arrow_preview(df: pd.DataFrame) -> pd.DataFrame:
 # ---------- PAGE ----------
 def page():
     st.title("⬆️ Inventory Upload (skip duplicates)")
-    st.caption("Uploads inventory rows fast. If a (item_name, item_barcode) already exists, it’s skipped automatically.")
+    st.caption("If a row conflicts with any UNIQUE constraint, it will be skipped (no error).")
 
     st.download_button(
         "📄 Download Excel template",
@@ -73,7 +67,7 @@ def page():
         "Choose CSV or Excel for inventory",
         key="inventory_uploader",
         type=["csv", "xlsx", "xls"],
-        help="Headers must match actual inventory columns (subset allowed).",
+        help="Headers must match real columns (subset allowed). Do not include item_id/created_at/updated_at.",
     )
     if file is None:
         st.info("No file selected yet.")
@@ -84,9 +78,8 @@ def page():
     st.info(f"Loaded file with **{df.shape[0]}** rows and **{df.shape[1]}** columns.")
     st.dataframe(_arrow_preview(df.head(250)), use_container_width=True, height=300)
 
-    # Commit
     if st.button("✅ Commit to DB", key="commit_inventory", type="primary"):
-        with st.spinner("Inserting inventory rows (skipping duplicates)…"):
+        with st.spinner("Staging and inserting (skipping duplicates)…"):
             try:
                 result = bulk_insert_inventory_skip_conflicts(df=df)
                 st.success("✅ Inventory upload finished.")
