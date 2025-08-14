@@ -1,8 +1,7 @@
-# upload_handler.py – FAST v2.2
+# upload_handler.py – FAST v2.3
 # - Generic COPY-based bulk insert (subset headers, numeric coercion)
 # - Unified purchases/sales flow (input/output quantity, item_id resolved)
-# - NEW: Repair mode for inventory pairing (fills missing name/barcode on matching row
-#        when safe; prevents conflicts)
+# - Repair mode (fills missing OR mismatched name/barcode when safe), counting repairs
 
 from __future__ import annotations
 
@@ -199,10 +198,7 @@ def get_row_count(table: str, schema: str = "public") -> int:
 
 # ───────────────────────── unified Purchases/Sales flow ───────────────────────── #
 
-SALE_TYPES = {
-    "sales invoice",
-    "sales return invoice",
-}
+SALE_TYPES = {"sales invoice", "sales return invoice"}
 PURCHASE_TYPES = {
     "purchase invoice direct",
     "purchasing return invoice",
@@ -211,27 +207,19 @@ PURCHASE_TYPES = {
     "purchase return invoice",
 }
 
-# Which bill types use input vs output quantity in the Excel template
-INPUT_QTY_TYPES = {
-    "purchase invoice direct", "purchase invoice", "sales return invoice"
-}
-OUTPUT_QTY_TYPES = {
-    "sales invoice", "purchasing return invoice", "purchase return invoice"
-}
+# Excel IO quantity mapping
+INPUT_QTY_TYPES  = {"purchase invoice direct", "purchase invoice", "sales return invoice"}
+OUTPUT_QTY_TYPES = {"sales invoice", "purchasing return invoice", "purchase return invoice"}
 
 def _normalize_bill_type(s: pd.Series) -> pd.Series:
     return s.fillna("").astype(str).str.strip().str.casefold()
 
 def _bill_sign(bt: str) -> int:
     bt = (bt or "").strip().lower()
-    if bt in ("sales invoice",):
-        return -1
-    if bt in ("sales return invoice",):
-        return +1
-    if bt in ("purchase invoice direct", "purchase invoice"):
-        return +1
-    if bt in ("purchasing return invoice", "purchase return invoice"):
-        return -1
+    if bt in ("sales invoice",): return -1
+    if bt in ("sales return invoice",): return +1
+    if bt in ("purchase invoice direct", "purchase invoice"): return +1
+    if bt in ("purchasing return invoice", "purchase return invoice"): return -1
     return 0
 
 def _coerce_qty_series(s: pd.Series) -> pd.Series:
@@ -247,8 +235,7 @@ def _derive_quantity_from_io(df: pd.DataFrame) -> pd.DataFrame:
     bt = _normalize_bill_type(df2.get("bill_type", pd.Series([], dtype="object")))
     in_q = _coerce_qty_series(df2.get("input_quantity", pd.Series([], dtype="object")))
     out_q = _coerce_qty_series(df2.get("output_quantity", pd.Series([], dtype="object")))
-    is_input = bt.isin(INPUT_QTY_TYPES)
-    df2["quantity"] = in_q.where(is_input, out_q)
+    df2["quantity"] = in_q.where(bt.isin(INPUT_QTY_TYPES), out_q)
     df2["bill_type"] = bt
     return df2
 
@@ -258,19 +245,21 @@ def _resolve_item_ids_and_create(
     df: pd.DataFrame,
     *,
     allow_create_positive_purchases: bool = True,
-    repair_missing_links: bool = True,
-) -> Tuple[pd.DataFrame, Dict[int, int]]:
+    repair_missing_links: bool = True,      # fill NULLs
+    repair_mismatched_pairs: bool = True,   # change mismatched values safely
+) -> Tuple[pd.DataFrame, Dict[int, int], int]:
     """
-    STRICT pair matching with optional repair:
+    STRICT pair matching + REPAIR:
       - Each row MUST have both item_name and item_barcode (non-empty after str/strip).
       - If exact (name, barcode) pair exists → use it.
       - If name or barcode exists but NOT the exact pair:
           * If both map to different item_ids → error.
-          * If one side exists and the other is NULL/blank in that row → if repair mode ON
-            and no conflict, UPDATE the inventory row to set the missing field.
+          * If one side exists and the other is NULL OR mismatched → if repair mode ON
+            and no conflict, UPDATE that inventory row to set/correct the missing/mismatched field.
       - If neither exists:
           * create item ONLY for positive purchases (purchase invoice direct / purchase invoice),
             otherwise error.
+    Returns (df_with_item_id, created_map, repairs_count).
     """
     df2 = df.copy()
 
@@ -323,6 +312,8 @@ def _resolve_item_ids_and_create(
                 pair_map[(nm, bc)] = iid
 
     created: Dict[int, int] = {}
+    repairs = 0
+
     if "item_id" not in df2.columns:
         df2["item_id"] = pd.NA
 
@@ -351,38 +342,58 @@ def _resolve_item_ids_and_create(
                     f"Row {idx}: item_name and item_barcode refer to different existing items "
                     f"(name→id {name_hit[0]}, barcode→id {code_hit[0]})."
                 )
-            # Same id but pair incomplete (one side NULL in DB) → repair if enabled
+            # Same id but pair incomplete or mismatched → repair if enabled and safe
             iid = name_hit[0]
             stored_bc = name_hit[1]
             stored_nm = code_hit[1]
-            need_repair = (stored_bc is None) or (stored_nm is None)
-            if need_repair and repair_missing_links:
-                # ensure no conflict: barcode and name aren't used by other rows
-                # (Already confirmed code_hit and name_hit point to same iid)
+            need_bc_fix = (stored_bc is None) or (stored_bc != bc)
+            need_nm_fix = (stored_nm is None) or (stored_nm != nm)
+            if (need_bc_fix or need_nm_fix) and (repair_missing_links or repair_mismatched_pairs):
+                # Conflicts?
+                other_for_pair = pair_map.get((nm, bc))
+                if other_for_pair is not None and other_for_pair != iid:
+                    raise ValueError(
+                        f"Row {idx}: cannot repair to pair (name,barcode) already used by item {other_for_pair}."
+                    )
+                if bc in code_map and code_map[bc][0] != iid:
+                    raise ValueError(f"Row {idx}: cannot repair; barcode '{bc}' belongs to item {code_map[bc][0]}.")
+                if nm in name_map and name_map[nm][0] != iid:
+                    raise ValueError(f"Row {idx}: cannot repair; name '{nm}' belongs to item {name_map[nm][0]}.")
+
+                # Remove old reverse mappings if changing
+                if stored_bc and stored_bc != bc:
+                    try:
+                        if code_map.get(stored_bc, (None,))[0] == iid:
+                            del code_map[stored_bc]
+                    except Exception:
+                        pass
+                if stored_nm and stored_nm != nm:
+                    try:
+                        if name_map.get(stored_nm, (None,))[0] == iid:
+                            del name_map[stored_nm]
+                    except Exception:
+                        pass
+
                 upd = text("""
                     UPDATE inventory
-                    SET item_name = COALESCE(item_name, :nm),
-                        item_barcode = COALESCE(item_barcode, :bc),
+                    SET item_name = :nm,
+                        item_barcode = :bc,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE item_id = :iid
                 """)
                 conn.execute(upd, {"nm": nm, "bc": bc, "iid": iid})
-                # update maps
                 name_map[nm] = (iid, bc)
                 code_map[bc] = (iid, nm)
                 pair_map[(nm, bc)] = iid
+                repairs += 1
             df2.at[idx, "item_id"] = int(iid)
             continue
 
         if name_hit and not code_hit:
-            # Name exists, barcode not known in map
             iid, stored_bc = name_hit
             if stored_bc is None and repair_missing_links:
-                # safe repair only if this barcode isn't mapped to another item
                 if bc in code_map and code_map[bc][0] != iid:
-                    raise ValueError(
-                        f"Row {idx}: cannot repair; barcode '{bc}' belongs to item {code_map[bc][0]}."
-                    )
+                    raise ValueError(f"Row {idx}: cannot repair; barcode '{bc}' belongs to item {code_map[bc][0]}.")
                 upd = text("""
                     UPDATE inventory
                     SET item_barcode = :bc, updated_at = CURRENT_TIMESTAMP
@@ -392,9 +403,31 @@ def _resolve_item_ids_and_create(
                 name_map[nm] = (iid, bc)
                 code_map[bc] = (iid, nm)
                 pair_map[(nm, bc)] = iid
+                repairs += 1
                 df2.at[idx, "item_id"] = int(iid)
                 continue
-            # strict mode (or barcode stored & different) → error
+            # Mismatch (stored_bc different) → change if allowed and safe
+            if repair_mismatched_pairs and stored_bc and stored_bc != bc:
+                if bc in code_map and code_map[bc][0] != iid:
+                    raise ValueError(f"Row {idx}: cannot repair; barcode '{bc}' belongs to item {code_map[bc][0]}.")
+                # Drop old mapping for previous barcode
+                try:
+                    if code_map.get(stored_bc, (None,))[0] == iid:
+                        del code_map[stored_bc]
+                except Exception:
+                    pass
+                upd = text("""
+                    UPDATE inventory
+                    SET item_barcode = :bc, updated_at = CURRENT_TIMESTAMP
+                    WHERE item_id = :iid
+                """)
+                conn.execute(upd, {"bc": bc, "iid": iid})
+                name_map[nm] = (iid, bc)
+                code_map[bc] = (iid, nm)
+                pair_map[(nm, bc)] = iid
+                repairs += 1
+                df2.at[idx, "item_id"] = int(iid)
+                continue
             raise ValueError(
                 f"Row {idx}: item_name exists (id {iid}) but provided barcode '{bc}' "
                 f"does not match stored barcode '{stored_bc or ''}'."
@@ -404,9 +437,7 @@ def _resolve_item_ids_and_create(
             iid, stored_nm = code_hit
             if stored_nm is None and repair_missing_links:
                 if nm in name_map and name_map[nm][0] != iid:
-                    raise ValueError(
-                        f"Row {idx}: cannot repair; name '{nm}' belongs to item {name_map[nm][0]}."
-                    )
+                    raise ValueError(f"Row {idx}: cannot repair; name '{nm}' belongs to item {name_map[nm][0]}.")
                 upd = text("""
                     UPDATE inventory
                     SET item_name = :nm, updated_at = CURRENT_TIMESTAMP
@@ -416,6 +447,27 @@ def _resolve_item_ids_and_create(
                 name_map[nm] = (iid, bc)
                 code_map[bc] = (iid, nm)
                 pair_map[(nm, bc)] = iid
+                repairs += 1
+                df2.at[idx, "item_id"] = int(iid)
+                continue
+            if repair_mismatched_pairs and stored_nm and stored_nm != nm:
+                if nm in name_map and name_map[nm][0] != iid:
+                    raise ValueError(f"Row {idx}: cannot repair; name '{nm}' belongs to item {name_map[nm][0]}.")
+                try:
+                    if name_map.get(stored_nm, (None,))[0] == iid:
+                        del name_map[stored_nm]
+                except Exception:
+                    pass
+                upd = text("""
+                    UPDATE inventory
+                    SET item_name = :nm, updated_at = CURRENT_TIMESTAMP
+                    WHERE item_id = :iid
+                """)
+                conn.execute(upd, {"nm": nm, "iid": iid})
+                name_map[nm] = (iid, bc)
+                code_map[bc] = (iid, nm)
+                pair_map[(nm, bc)] = iid
+                repairs += 1
                 df2.at[idx, "item_id"] = int(iid)
                 continue
             raise ValueError(
@@ -451,16 +503,27 @@ def _resolve_item_ids_and_create(
         )
 
     df2["item_id"] = pd.to_numeric(df2["item_id"], errors="raise").astype(int)
-    return df2, created
+    return df2, created, repairs
+
+
+def _aggregate_deltas(df: pd.DataFrame) -> pd.DataFrame:
+    tmp = df.copy()
+    tmp["quantity"] = pd.to_numeric(tmp["quantity"], errors="coerce").fillna(0).round(0).astype(int)
+    tmp["__sign"] = tmp["bill_type"].astype(str).map(_bill_sign)
+    tmp["__delta"] = tmp["quantity"] * tmp["__sign"]
+    agg = tmp.groupby("item_id", as_index=False)["__delta"].sum().rename(columns={"__delta": "delta"})
+    agg = agg[agg["delta"] != 0]
+    return agg
 
 
 @run_transaction
 def bulk_insert_unified_txns(conn, *, df: pd.DataFrame, schema: str = "public") -> Dict[str, Any]:
     """
     Unified purchases/sales upload with input/output quantity support + repair mode.
+    Returns per-table insert stats and a repairs summary.
     """
     t0 = time.perf_counter()
-    out: Dict[str, Any] = {"purchases": None, "sales": None, "inventory_update": None}
+    out: Dict[str, Any] = {"purchases": None, "sales": None, "inventory_update": None, "repairs": None}
 
     if df.empty:
         raise ValueError("No data rows found.")
@@ -482,29 +545,37 @@ def bulk_insert_unified_txns(conn, *, df: pd.DataFrame, schema: str = "public") 
             f"Sales: {sorted(SALE_TYPES)} | Purchases: {sorted(PURCHASE_TYPES)}"
         )
 
+    repairs_p = repairs_s = 0
+
     # Purchases (repair ON, create allowed)
+    purchases_resolved = None
     if not purchases_raw.empty:
         purchases_raw.rename(columns={"txn_date": "purchase_date", "unit_price": "purchase_price"}, inplace=True)
-        purchases_resolved, _ = _resolve_item_ids_and_create(
-            conn, purchases_raw, allow_create_positive_purchases=True, repair_missing_links=True
+        purchases_resolved, _created_p, repairs_p = _resolve_item_ids_and_create(
+            conn, purchases_raw, allow_create_positive_purchases=True,
+            repair_missing_links=True, repair_mismatched_pairs=True
         )
         out["purchases"] = _bulk_insert_core(conn, df=purchases_resolved, table="purchases", schema=schema)
 
     # Sales (repair ON, create NOT allowed)
+    sales_resolved = None
     if not sales_raw.empty:
         sales_raw.rename(columns={"txn_date": "sale_date", "unit_price": "sale_price"}, inplace=True)
-        sales_resolved, _ = _resolve_item_ids_and_create(
-            conn, sales_raw, allow_create_positive_purchases=False, repair_missing_links=True
+        sales_resolved, _created_s, repairs_s = _resolve_item_ids_and_create(
+            conn, sales_raw, allow_create_positive_purchases=False,
+            repair_missing_links=True, repair_mismatched_pairs=True
         )
         out["sales"] = _bulk_insert_core(conn, df=sales_resolved, table="sales", schema=schema)
 
-    # Inventory deltas (both)
-    both = pd.concat([purchases_raw, sales_raw], ignore_index=True) if (not purchases_raw.empty or not sales_raw.empty) else pd.DataFrame()
-    if not both.empty:
-        both_ids, _ = _resolve_item_ids_and_create(
-            conn, both, allow_create_positive_purchases=False, repair_missing_links=True
-        )
-        deltas = _aggregate_deltas(both_ids)
+    # Inventory deltas (use already-resolved frames to avoid re-repairing)
+    both_ids = []
+    if purchases_resolved is not None:
+        both_ids.append(purchases_resolved[["item_id", "quantity", "bill_type"]])
+    if sales_resolved is not None:
+        both_ids.append(sales_resolved[["item_id", "quantity", "bill_type"]])
+    if both_ids:
+        both = pd.concat(both_ids, ignore_index=True)
+        deltas = _aggregate_deltas(both)
         if not deltas.empty:
             upd = text("""
                 WITH changes AS (
@@ -523,6 +594,7 @@ def bulk_insert_unified_txns(conn, *, df: pd.DataFrame, schema: str = "public") 
     else:
         out["inventory_update"] = {"items_updated": 0}
 
+    out["repairs"] = {"purchases": int(repairs_p), "sales": int(repairs_s), "total": int(repairs_p + repairs_s)}
     out["total_ms"] = (time.perf_counter() - t0) * 1000
     return out
 
