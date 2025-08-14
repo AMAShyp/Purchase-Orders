@@ -1,12 +1,15 @@
-# upload_handler.py – FAST v2.6.1
+# upload_handler.py – FAST v2.7
 # - COPY-based bulk insert (subset headers, numeric coercion)
 # - Unified purchases/sales flow with:
 #     * input_quantity / output_quantity → single DB quantity
-#     * strict pair matching on (item_name, item_barcode) + repair mode
+#     * pair matching on (item_name, item_barcode) with repair mode
 #     * continue-on-error (skip unfixable), end summary of repairs/skips
 # - Prices hardened:
 #     * Missing/blank sale_price or purchase_price → 0 (counted)
 #     * Any numeric column NaN at COPY time → 0 (prevents NULLs in CSV)
+# - NEW in v2.7:
+#     * Inventory delta UPDATE now uses raw psycopg2 with %s placeholders.
+#       Falls back to a VALUES(...) join if raw cursor is not available.
 
 from __future__ import annotations
 
@@ -120,6 +123,9 @@ def _coerce_numeric_like(df: pd.DataFrame, cols: List[str], as_int: bool) -> Non
 # ───────────────────────── COPY plumbing ───────────────────────── #
 
 def _get_raw_psycopg2_connection(sqlalchemy_conn) -> Optional[Any]:
+    """
+    Try to unwrap a SQLAlchemy Connection/Engine to a raw psycopg2 connection.
+    """
     raw = getattr(sqlalchemy_conn, "connection", None)
     if raw is None:
         return None
@@ -574,19 +580,52 @@ def bulk_insert_unified_txns(
         both_for_delta = pd.concat([both_for_delta, purchases_resolved[["item_id", "quantity", "bill_type"]]])
     if not sales_insert.empty:
         both_for_delta = pd.concat([both_for_delta, sales_resolved[["item_id", "quantity", "bill_type"]]])
+
     if not both_for_delta.empty:
         deltas = _aggregate_deltas(both_for_delta)
         if not deltas.empty:
-            conn.execute(text("""
-                WITH changes AS (
-                    SELECT UNNEST(:ids::int[]) AS item_id, UNNEST(:ds::int[]) AS d
-                )
-                UPDATE inventory i
-                SET current_stock = i.current_stock + c.d,
-                    updated_at = CURRENT_TIMESTAMP
-                FROM changes c
-                WHERE i.item_id = c.item_id AND c.d <> 0;
-            """), {"ids": deltas["item_id"].tolist(), "ds": deltas["delta"].tolist()})
+            ids = [int(x) for x in deltas["item_id"].tolist()]
+            ds  = [int(x) for x in deltas["delta"].tolist()]
+
+            # Prefer raw psycopg2 cursor with %s placeholders
+            raw = _get_raw_psycopg2_connection(conn)
+            table_inv = f'"{schema}"."inventory"'
+            if raw is not None:
+                cur = raw.cursor()
+                try:
+                    cur.execute(
+                        f"""
+                        WITH changes AS (
+                            SELECT unnest(%s::int[]) AS item_id,
+                                   unnest(%s::int[]) AS d
+                        )
+                        UPDATE {table_inv} i
+                        SET current_stock = i.current_stock + c.d,
+                            updated_at = CURRENT_TIMESTAMP
+                        FROM changes c
+                        WHERE i.item_id = c.item_id AND c.d <> 0;
+                        """,
+                        (ids, ds),
+                    )
+                finally:
+                    cur.close()
+            else:
+                # Fallback: VALUES join (works on SQLAlchemy connection)
+                pairs = list(zip(ids, ds))
+                values_clause = ", ".join(f"(:id{i}, :d{i})" for i in range(len(pairs)))
+                sql_vals = f"""
+                    UPDATE {table_inv} AS i
+                    SET current_stock = i.current_stock + v.d,
+                        updated_at = CURRENT_TIMESTAMP
+                    FROM (VALUES {values_clause}) AS v(item_id, d)
+                    WHERE i.item_id = v.item_id AND v.d <> 0;
+                """
+                params = {}
+                for i, (idv, dv) in enumerate(pairs):
+                    params[f"id{i}"] = int(idv)
+                    params[f"d{i}"] = int(dv)
+                conn.execute(text(sql_vals), params)
+
             out["inventory_update"] = {"items_updated": int(deltas.shape[0])}
         else:
             out["inventory_update"] = {"items_updated": 0}
