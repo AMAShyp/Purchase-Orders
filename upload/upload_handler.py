@@ -1,4 +1,4 @@
-# upload_handler.py – FAST v2.7
+# upload_handler.py – FAST v2.8
 # - COPY-based bulk insert (subset headers, numeric coercion)
 # - Unified purchases/sales flow with:
 #     * input_quantity / output_quantity → single DB quantity
@@ -7,9 +7,9 @@
 # - Prices hardened:
 #     * Missing/blank sale_price or purchase_price → 0 (counted)
 #     * Any numeric column NaN at COPY time → 0 (prevents NULLs in CSV)
-# - NEW in v2.7:
-#     * Inventory delta UPDATE now uses raw psycopg2 with %s placeholders.
-#       Falls back to a VALUES(...) join if raw cursor is not available.
+# - NEW in v2.8:
+#     * bulk_insert_unified_txns(..., update_inventory: bool) → optionally
+#       skip inventory stock updates (insert-only mode) but return delta preview.
 
 from __future__ import annotations
 
@@ -484,14 +484,17 @@ def bulk_insert_unified_txns(
     df: pd.DataFrame,
     schema: str = "public",
     mismatch_policy: Literal["prefer_barcode", "prefer_name"] = "prefer_barcode",
+    update_inventory: bool = True,
 ) -> Dict[str, Any]:
     """
     Unified purchases/sales upload with input/output quantity support + repair mode.
     Continues past bad rows; returns detailed summary. Filters helper columns before COPY.
     Ensures price columns are NOT NULL (fill missing with 0). Numeric columns NaN→0 before COPY.
+    If update_inventory=False, inventory changes are skipped (insert-only mode) and a delta preview is returned.
     """
     t0 = time.perf_counter()
     out: Dict[str, Any] = {
+        "mode": "insert_and_update" if update_inventory else "insert_only",
         "purchases": None,
         "sales": None,
         "inventory_update": None,
@@ -581,56 +584,71 @@ def bulk_insert_unified_txns(
     if not sales_insert.empty:
         both_for_delta = pd.concat([both_for_delta, sales_resolved[["item_id", "quantity", "bill_type"]]])
 
+    # Compute deltas regardless, so we can preview in insert-only mode
+    delta_summary = {"items": 0, "net_delta": 0}
+    deltas = pd.DataFrame()
     if not both_for_delta.empty:
         deltas = _aggregate_deltas(both_for_delta)
         if not deltas.empty:
-            ids = [int(x) for x in deltas["item_id"].tolist()]
-            ds  = [int(x) for x in deltas["delta"].tolist()]
+            delta_summary["items"] = int(deltas.shape[0])
+            delta_summary["net_delta"] = int(deltas["delta"].sum())
 
-            # Prefer raw psycopg2 cursor with %s placeholders
-            raw = _get_raw_psycopg2_connection(conn)
-            table_inv = f'"{schema}"."inventory"'
-            if raw is not None:
-                cur = raw.cursor()
-                try:
-                    cur.execute(
-                        f"""
-                        WITH changes AS (
-                            SELECT unnest(%s::int[]) AS item_id,
-                                   unnest(%s::int[]) AS d
-                        )
-                        UPDATE {table_inv} i
-                        SET current_stock = i.current_stock + c.d,
-                            updated_at = CURRENT_TIMESTAMP
-                        FROM changes c
-                        WHERE i.item_id = c.item_id AND c.d <> 0;
-                        """,
-                        (ids, ds),
+    if update_inventory and not deltas.empty:
+        ids = [int(x) for x in deltas["item_id"].tolist()]
+        ds  = [int(x) for x in deltas["delta"].tolist()]
+
+        # Prefer raw psycopg2 cursor with %s placeholders
+        raw = _get_raw_psycopg2_connection(conn)
+        table_inv = f'"{schema}"."inventory"'
+        if raw is not None:
+            cur = raw.cursor()
+            try:
+                cur.execute(
+                    f"""
+                    WITH changes AS (
+                        SELECT unnest(%s::int[]) AS item_id,
+                               unnest(%s::int[]) AS d
                     )
-                finally:
-                    cur.close()
-            else:
-                # Fallback: VALUES join (works on SQLAlchemy connection)
-                pairs = list(zip(ids, ds))
-                values_clause = ", ".join(f"(:id{i}, :d{i})" for i in range(len(pairs)))
-                sql_vals = f"""
-                    UPDATE {table_inv} AS i
-                    SET current_stock = i.current_stock + v.d,
+                    UPDATE {table_inv} i
+                    SET current_stock = i.current_stock + c.d,
                         updated_at = CURRENT_TIMESTAMP
-                    FROM (VALUES {values_clause}) AS v(item_id, d)
-                    WHERE i.item_id = v.item_id AND v.d <> 0;
-                """
-                params = {}
-                for i, (idv, dv) in enumerate(pairs):
-                    params[f"id{i}"] = int(idv)
-                    params[f"d{i}"] = int(dv)
-                conn.execute(text(sql_vals), params)
-
-            out["inventory_update"] = {"items_updated": int(deltas.shape[0])}
+                    FROM changes c
+                    WHERE i.item_id = c.item_id AND c.d <> 0;
+                    """,
+                    (ids, ds),
+                )
+            finally:
+                cur.close()
         else:
-            out["inventory_update"] = {"items_updated": 0}
+            # Fallback: VALUES join (works on SQLAlchemy connection)
+            pairs = list(zip(ids, ds))
+            values_clause = ", ".join(f"(:id{i}, :d{i})" for i in range(len(pairs)))
+            sql_vals = f"""
+                UPDATE {table_inv} AS i
+                SET current_stock = i.current_stock + v.d,
+                    updated_at = CURRENT_TIMESTAMP
+                FROM (VALUES {values_clause}) AS v(item_id, d)
+                WHERE i.item_id = v.item_id AND v.d <> 0;
+            """
+            params = {}
+            for i, (idv, dv) in enumerate(pairs):
+                params[f"id{i}"] = int(idv)
+                params[f"d{i}"] = int(dv)
+            conn.execute(text(sql_vals), params)
+
+        out["inventory_update"] = {
+            "mode": "insert_and_update",
+            "items_updated": delta_summary["items"],
+            "net_delta": delta_summary["net_delta"],
+        }
     else:
-        out["inventory_update"] = {"items_updated": 0}
+        out["inventory_update"] = {
+            "mode": "insert_only",
+            "items_updated": 0,
+            "net_delta_preview": delta_summary["net_delta"],
+            "items_would_change": delta_summary["items"],
+            "skipped": True,
+        }
 
     out["repairs_summary"] = repairs_total
     out["skipped_summary"] = {**skipped_total, "unknown_bill_type_rows": out["unknown_bill_type_rows"]}
