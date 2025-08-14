@@ -1,4 +1,4 @@
-# sale_upload.py – Unified Purchases & Sales upload (input/output quantity, no item_id in Excel)
+# sale_upload.py – Unified Purchases & Sales upload (input/output quantity + repairs summary)
 import time
 from io import StringIO, BytesIO
 from typing import List
@@ -13,20 +13,16 @@ except Exception:
 
 
 UNIFIED_TEMPLATE_COLS = [
-    # No item_id needed — resolved by (item_name, item_barcode)
     "bill_type",      # routes the row
     "txn_date",       # → purchase_date / sale_date
     "item_name",
     "item_barcode",
     "input_quantity",   # used when stock flows IN
     "output_quantity",  # used when stock flows OUT
-    "unit_price",     # → purchase_price / sale_price (optional)
-    # Optional helper columns (used when auto-creating items on positive purchases):
+    "unit_price",       # → purchase_price / sale_price (optional)
+    # Optional for first-time creation on positive purchases:
     # "category", "unit"
 ]
-
-SALES_ALLOWED = ["sales invoice", "sales return invoice"]
-PURCHASES_ALLOWED = ["purchase invoice direct", "purchasing return invoice", "purchase invoice", "purchase return invoice"]
 
 def _read_file(file) -> pd.DataFrame:
     t0 = time.perf_counter()
@@ -60,12 +56,11 @@ def _section_unified():
         )
     with c2:
         st.caption(
-            "Use one sheet with headers: "
-            "`bill_type, txn_date, item_name, item_barcode, input_quantity, output_quantity, unit_price`.\n"
-            "We derive the single DB `quantity` per row:\n"
-            "• Input quantity → **purchase invoice direct**, **purchase invoice**, **sales return invoice**\n"
-            "• Output quantity → **sales invoice**, **purchasing return invoice**, **purchase return invoice**\n\n"
-            "Item IDs are resolved by (item_name, item_barcode); missing items on positive purchases are created."
+            "Headers: `bill_type, txn_date, item_name, item_barcode, input_quantity, output_quantity, unit_price`.\n"
+            "Input qty used for **purchase invoice direct / purchase invoice / sales return invoice**; "
+            "Output qty for **sales invoice / purchasing return invoice / purchase return invoice**.\n"
+            "We strictly pair `item_name`+`item_barcode` and will **repair** missing/mismatched pairs when safe. "
+            "Unknown items are auto-created only for positive purchases."
         )
 
     file = st.file_uploader(
@@ -102,7 +97,13 @@ def _section_unified():
                 total_ms = (time.perf_counter() - t0) * 1000
 
                 status.update(label="Commit successful ✅", state="complete")
-                st.success("Inserted into purchases/sales and updated inventory.")
+                st.success("Inserted into purchases/sales, updated inventory, and applied safe repairs where needed.")
+
+                repairs = result.get("repairs") or {}
+                st.info(
+                    f"🛠️ Repairs applied → purchases: {repairs.get('purchases', 0)}, "
+                    f"sales: {repairs.get('sales', 0)}, total: **{repairs.get('total', 0)}**"
+                )
 
                 st.write({
                     "purchases": result.get("purchases"),
@@ -134,8 +135,8 @@ def _section_unified():
     st.divider()
 
 def page():
-    st.title("🧾 Unified Purchases & Sales Upload (input/output quantity)")
-    st.caption("No item_id needed — we resolve by name/barcode, derive quantity from input/output, and update stock.")
+    st.title("🧾 Unified Purchases & Sales Upload (input/output quantity + repairs)")
+    st.caption("Strict (name+barcode) pairing with safe auto-repair. No item_id in Excel required.")
     _section_unified()
 
 if __name__ == "__main__":
