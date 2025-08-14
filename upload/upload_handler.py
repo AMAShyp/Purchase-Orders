@@ -1,11 +1,12 @@
-# upload_handler.py – FAST v2.5
+# upload_handler.py – FAST v2.6
 # - COPY-based bulk insert (subset headers, numeric coercion)
 # - Unified purchases/sales flow with:
 #     * input_quantity / output_quantity → single DB quantity
 #     * strict pair matching on (item_name, item_barcode) + repair mode
 #     * continue-on-error (skip unfixable), end summary of repairs/skips
-# - NEW in v2.5: ensure price columns are NOT NULL
-#     * Missing/blank sale_price or purchase_price are defaulted to 0 (counted)
+# - Prices hardened:
+#     * Missing/blank sale_price or purchase_price → 0 (counted)
+#     * Any numeric column NaN at COPY time → 0 (prevents \N in CSV)
 
 from __future__ import annotations
 
@@ -91,22 +92,29 @@ def _align_subset_columns(df: pd.DataFrame, db_cols: List[str]) -> List[str]:
     return [c for c in db_cols if c.lower() in file_lowers]
 
 def _coerce_numeric_like(df: pd.DataFrame, cols: List[str], as_int: bool) -> None:
+    """
+    In-place coercion:
+      - Strip commas/spaces from strings
+      - to_numeric(errors='coerce')
+      - If integer-target: round + fillna(0) + Int64 dtype
+      - If numeric-target: fillna(0) (prevents \N in COPY)
+    """
     for c in cols:
         if c not in df.columns:
             continue
         s = df[c]
+        # Already numeric-like?
         if s.dtype.kind in "biufc":
-            if as_int:
-                df[c] = pd.to_numeric(s, errors="coerce").fillna(0).round(0).astype("Int64")
-            else:
-                df[c] = pd.to_numeric(s, errors="coerce")
-            continue
-        s2 = s.astype(str).map(lambda x: _num_clean_re.sub("", x))
-        s_num = pd.to_numeric(s2, errors="coerce")
-        if as_int:
-            df[c] = s_num.fillna(0).round(0).astype("Int64")
+            num = pd.to_numeric(s, errors="coerce")
         else:
-            df[c] = s_num
+            s2 = s.astype(str).map(lambda x: _num_clean_re.sub("", x))
+            num = pd.to_numeric(s2, errors="coerce")
+
+        if as_int:
+            df[c] = num.fillna(0).round(0).astype("Int64")
+        else:
+            # IMPORTANT: fillna(0) for numeric columns so COPY never sees \N
+            df[c] = num.fillna(0)
 
 
 # ───────────────────────── COPY plumbing ───────────────────────── #
@@ -119,7 +127,7 @@ def _get_raw_psycopg2_connection(sqlalchemy_conn) -> Optional[Any]:
     return psyco if hasattr(psyco, "cursor") else None
 
 def _to_csv_buffer(df: pd.DataFrame) -> io.StringIO:
-    # write NULLs as \N (escaped for Python)
+    # Write NULLs as \N (escaped for Python). We minimize NULLs via numeric fillna(0).
     buf = io.StringIO()
     df.to_csv(buf, index=False, header=False, na_rep='\\N')
     buf.seek(0)
@@ -246,7 +254,6 @@ def _derive_quantity_from_io(df: pd.DataFrame) -> pd.DataFrame:
     df2["bill_type"] = bt
     return df2
 
-# NEW: ensure price columns exist, are numeric, and NOT NULL (fill missing with 0)
 def _ensure_price_not_null(df: pd.DataFrame, price_col: str) -> Tuple[pd.DataFrame, int]:
     """
     Returns (df_with_price, defaults_count). Any non-numeric or missing values
@@ -302,9 +309,7 @@ def _resolve_item_ids_and_create(
         "mismatch_preferred_barcode": 0,
         "mismatch_preferred_name": 0,
         "created_new_items": 0,
-        # NEW stats below are added in bulk_insert_unified_txns after price defaults
-        # "sale_price_defaulted_to_zero": 0,
-        # "purchase_price_defaulted_to_zero": 0,
+        # counters for price defaults are added in bulk_insert_unified_txns
     }
     skipped: Dict[str, int] = {"skipped_missing_pair": 0, "skipped_unknown_item": 0}
 
@@ -369,11 +374,7 @@ def _resolve_item_ids_and_create(
 
         # both exist but different ids → resolve by policy
         if name_hit and code_hit and name_hit[0] != code_hit[0]:
-            if mismatch_policy == "prefer_barcode":
-                df2.at[idx, "item_id"] = int(code_hit[0])
-                # price default counts are handled in bulk_insert_unified_txns
-            else:
-                df2.at[idx, "item_id"] = int(name_hit[0])
+            df2.at[idx, "item_id"] = int(code_hit[0] if mismatch_policy == "prefer_barcode" else name_hit[0])
             kept_rows.append(idx)
             continue
 
@@ -398,10 +399,7 @@ def _resolve_item_ids_and_create(
                     name_map[nm] = (iid, bc); code_map[bc] = (iid, nm); pair_map[(nm, bc)] = iid
                     df2.at[idx, "item_id"] = int(iid); kept_rows.append(idx); continue
                 # prefer policy without DB change
-                if mismatch_policy == "prefer_barcode" and bc in code_map:
-                    df2.at[idx, "item_id"] = int(code_map[bc][0])
-                else:
-                    df2.at[idx, "item_id"] = int(iid)
+                df2.at[idx, "item_id"] = int(code_map[bc][0] if mismatch_policy == "prefer_barcode" else iid)
                 kept_rows.append(idx); continue
 
         # barcode exists; name unknown/different
@@ -424,10 +422,7 @@ def _resolve_item_ids_and_create(
                         del name_map[stored_nm]
                     code_map[bc] = (iid, nm); name_map[nm] = (iid, bc); pair_map[(nm, bc)] = iid
                     df2.at[idx, "item_id"] = int(iid); kept_rows.append(idx); continue
-                if mismatch_policy == "prefer_barcode":
-                    df2.at[idx, "item_id"] = int(iid)
-                else:
-                    df2.at[idx, "item_id"] = int(name_map[nm][0]) if nm in name_map else int(iid)
+                df2.at[idx, "item_id"] = int(iid if mismatch_policy == "prefer_barcode" else (name_map[nm][0] if nm in name_map else iid))
                 kept_rows.append(idx); continue
 
         # neither exists → create only for positive purchases
@@ -487,7 +482,7 @@ def bulk_insert_unified_txns(
     """
     Unified purchases/sales upload with input/output quantity support + repair mode.
     Continues past bad rows; returns detailed summary. Filters helper columns before COPY.
-    Ensures price columns are NOT NULL (fill missing with 0).
+    Ensures price columns are NOT NULL (fill missing with 0). Numeric columns NaN→0 before COPY.
     """
     t0 = time.perf_counter()
     out: Dict[str, Any] = {
@@ -522,7 +517,6 @@ def bulk_insert_unified_txns(
         "barcode_changed": 0, "name_changed": 0,
         "mismatch_preferred_barcode": 0, "mismatch_preferred_name": 0,
         "created_new_items": 0,
-        # NEW price-default counters:
         "sale_price_defaulted_to_zero": 0,
         "purchase_price_defaulted_to_zero": 0,
     }
