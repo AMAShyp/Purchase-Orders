@@ -95,4 +95,17 @@ def page():
                     count_df = fetch_dataframe('SELECT COUNT(*) AS total FROM "public"."inventory";')
                     st.info(f"📊 Table `inventory` now has **{int(count_df['total'].iloc[0])}** total rows.")
                     st.write("Last 5 rows by item_id:")
-                    last_rows = fet_
+                    last_rows = fetch_dataframe('SELECT * FROM "public"."inventory" ORDER BY item_id DESC LIMIT 5;')
+                    st.dataframe(last_rows, use_container_width=True, height=220)
+                except Exception as dbg_err:
+                    st.warning(f"Post-insert debug query failed: {dbg_err}")
+
+            except Exception as exc:
+                st.error(f"❌ Upload failed → {exc}")
+
+    st.divider()
+
+
+if __name__ == "__main__":
+    st.set_page_config(page_title="Inventory Upload", page_icon="⬆️", layout="wide")
+    page()
