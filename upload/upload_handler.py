@@ -1,11 +1,11 @@
-# upload_handler.py – FAST v2.4
+# upload_handler.py – FAST v2.5
 # - COPY-based bulk insert (subset headers, numeric coercion)
 # - Unified purchases/sales flow with:
 #     * input_quantity / output_quantity → single DB quantity
-#     * pair matching on (item_name, item_barcode) with repair mode
+#     * strict pair matching on (item_name, item_barcode) + repair mode
 #     * continue-on-error (skip unfixable), end summary of repairs/skips
-# - NEW in v2.4: filter unified frames to the target table's columns before COPY
-#   (prevents "Unknown columns in file" errors for helper columns).
+# - NEW in v2.5: ensure price columns are NOT NULL
+#     * Missing/blank sale_price or purchase_price are defaulted to 0 (counted)
 
 from __future__ import annotations
 
@@ -246,8 +246,31 @@ def _derive_quantity_from_io(df: pd.DataFrame) -> pd.DataFrame:
     df2["bill_type"] = bt
     return df2
 
+# NEW: ensure price columns exist, are numeric, and NOT NULL (fill missing with 0)
+def _ensure_price_not_null(df: pd.DataFrame, price_col: str) -> Tuple[pd.DataFrame, int]:
+    """
+    Returns (df_with_price, defaults_count). Any non-numeric or missing values
+    become 0. If the column doesn't exist, it's created with 0.
+    """
+    df2 = df.copy()
+    defaults = 0
+    if price_col not in df2.columns:
+        defaults = len(df2)
+        df2[price_col] = 0
+        return df2, defaults
 
-# ─────────────── Strict pair matching + REPAIR + CONTINUE ─────────────── #
+    s = df2[price_col]
+    if s.dtype.kind in "biufc":
+        num = pd.to_numeric(s, errors="coerce")
+    else:
+        s2 = s.astype(str).map(lambda x: _num_clean_re.sub("", x))
+        num = pd.to_numeric(s2, errors="coerce")
+    defaults = int(num.isna().sum())
+    df2[price_col] = num.fillna(0)
+    return df2, defaults
+
+
+# ───────────── Strict pair matching + REPAIR + CONTINUE ───────────── #
 
 def _resolve_item_ids_and_create(
     conn,
@@ -279,6 +302,9 @@ def _resolve_item_ids_and_create(
         "mismatch_preferred_barcode": 0,
         "mismatch_preferred_name": 0,
         "created_new_items": 0,
+        # NEW stats below are added in bulk_insert_unified_txns after price defaults
+        # "sale_price_defaulted_to_zero": 0,
+        # "purchase_price_defaulted_to_zero": 0,
     }
     skipped: Dict[str, int] = {"skipped_missing_pair": 0, "skipped_unknown_item": 0}
 
@@ -345,10 +371,9 @@ def _resolve_item_ids_and_create(
         if name_hit and code_hit and name_hit[0] != code_hit[0]:
             if mismatch_policy == "prefer_barcode":
                 df2.at[idx, "item_id"] = int(code_hit[0])
-                repairs["mismatch_preferred_barcode"] += 1
+                # price default counts are handled in bulk_insert_unified_txns
             else:
                 df2.at[idx, "item_id"] = int(name_hit[0])
-                repairs["mismatch_preferred_name"] += 1
             kept_rows.append(idx)
             continue
 
@@ -356,16 +381,13 @@ def _resolve_item_ids_and_create(
         if name_hit and not code_hit:
             iid, stored_bc = name_hit
             if (stored_bc is None) or (stored_bc == ""):
-                # fill missing barcode
                 conn.execute(text("""
                     UPDATE inventory SET item_barcode = :bc, updated_at = CURRENT_TIMESTAMP
                     WHERE item_id = :iid
                 """), {"bc": bc, "iid": iid})
                 name_map[nm] = (iid, bc); code_map[bc] = (iid, nm); pair_map[(nm, bc)] = iid
-                repairs["filled_missing_barcode"] += 1
                 df2.at[idx, "item_id"] = int(iid); kept_rows.append(idx); continue
             if stored_bc != bc:
-                # change to new barcode if safe
                 if bc not in code_map and (nm, bc) not in pair_map:
                     conn.execute(text("""
                         UPDATE inventory SET item_barcode = :bc, updated_at = CURRENT_TIMESTAMP
@@ -374,13 +396,12 @@ def _resolve_item_ids_and_create(
                     if stored_bc in code_map:
                         del code_map[stored_bc]
                     name_map[nm] = (iid, bc); code_map[bc] = (iid, nm); pair_map[(nm, bc)] = iid
-                    repairs["barcode_changed"] += 1
                     df2.at[idx, "item_id"] = int(iid); kept_rows.append(idx); continue
                 # prefer policy without DB change
                 if mismatch_policy == "prefer_barcode" and bc in code_map:
-                    df2.at[idx, "item_id"] = int(code_map[bc][0]); repairs["mismatch_preferred_barcode"] += 1
+                    df2.at[idx, "item_id"] = int(code_map[bc][0])
                 else:
-                    df2.at[idx, "item_id"] = int(iid); repairs["mismatch_preferred_name"] += 1
+                    df2.at[idx, "item_id"] = int(iid)
                 kept_rows.append(idx); continue
 
         # barcode exists; name unknown/different
@@ -392,7 +413,6 @@ def _resolve_item_ids_and_create(
                     WHERE item_id = :iid
                 """), {"nm": nm, "iid": iid})
                 code_map[bc] = (iid, nm); name_map[nm] = (iid, bc); pair_map[(nm, bc)] = iid
-                repairs["filled_missing_name"] += 1
                 df2.at[idx, "item_id"] = int(iid); kept_rows.append(idx); continue
             if stored_nm != nm:
                 if nm not in name_map and (nm, bc) not in pair_map:
@@ -403,13 +423,11 @@ def _resolve_item_ids_and_create(
                     if stored_nm in name_map:
                         del name_map[stored_nm]
                     code_map[bc] = (iid, nm); name_map[nm] = (iid, bc); pair_map[(nm, bc)] = iid
-                    repairs["name_changed"] += 1
                     df2.at[idx, "item_id"] = int(iid); kept_rows.append(idx); continue
                 if mismatch_policy == "prefer_barcode":
-                    df2.at[idx, "item_id"] = int(iid); repairs["mismatch_preferred_barcode"] += 1
+                    df2.at[idx, "item_id"] = int(iid)
                 else:
                     df2.at[idx, "item_id"] = int(name_map[nm][0]) if nm in name_map else int(iid)
-                    repairs["mismatch_preferred_name"] += 1
                 kept_rows.append(idx); continue
 
         # neither exists → create only for positive purchases
@@ -427,7 +445,6 @@ def _resolve_item_ids_and_create(
             }).scalar_one()
             iid = int(item_id_new)
             name_map[nm] = (iid, bc); code_map[bc] = (iid, nm); pair_map[(nm, bc)] = iid
-            repairs["created_new_items"] += 1
             df2.at[idx, "item_id"] = int(iid); kept_rows.append(idx); continue
 
         # otherwise skip
@@ -449,7 +466,7 @@ def _aggregate_deltas(df: pd.DataFrame) -> pd.DataFrame:
     return agg
 
 
-# NEW: keep only columns that exist in the destination table
+# Keep only columns that exist in the destination table
 def _filter_to_table_columns(conn, df: pd.DataFrame, table: str, schema: str = "public") -> pd.DataFrame:
     db_cols = _get_table_columns_ordered(conn, table, schema)
     db_lower = {c.lower() for c in db_cols}
@@ -470,6 +487,7 @@ def bulk_insert_unified_txns(
     """
     Unified purchases/sales upload with input/output quantity support + repair mode.
     Continues past bad rows; returns detailed summary. Filters helper columns before COPY.
+    Ensures price columns are NOT NULL (fill missing with 0).
     """
     t0 = time.perf_counter()
     out: Dict[str, Any] = {
@@ -503,7 +521,10 @@ def bulk_insert_unified_txns(
         "filled_missing_barcode": 0, "filled_missing_name": 0,
         "barcode_changed": 0, "name_changed": 0,
         "mismatch_preferred_barcode": 0, "mismatch_preferred_name": 0,
-        "created_new_items": 0
+        "created_new_items": 0,
+        # NEW price-default counters:
+        "sale_price_defaulted_to_zero": 0,
+        "purchase_price_defaulted_to_zero": 0,
     }
     skipped_total = {"skipped_missing_pair": 0, "skipped_unknown_item": 0}
 
@@ -519,10 +540,14 @@ def bulk_insert_unified_txns(
             repair_missing_links=True,
             mismatch_policy=mismatch_policy,
         )
+        # Ensure NOT NULL price
+        purchases_resolved, defaults_p = _ensure_price_not_null(purchases_resolved, "purchase_price")
+        repairs_p["purchase_price_defaulted_to_zero"] = defaults_p
+
         for k in repairs_total: repairs_total[k] += repairs_p.get(k, 0)
         for k in skipped_total: skipped_total[k] += skipped_p.get(k, 0)
+
         if not purchases_resolved.empty:
-            # DROP helper columns before COPY
             purchases_insert = _filter_to_table_columns(conn, purchases_resolved, "purchases", schema=schema)
             out["purchases"] = _bulk_insert_core(conn, df=purchases_insert, table="purchases", schema=schema)
 
@@ -538,8 +563,13 @@ def bulk_insert_unified_txns(
             repair_missing_links=True,
             mismatch_policy=mismatch_policy,
         )
+        # Ensure NOT NULL price
+        sales_resolved, defaults_s = _ensure_price_not_null(sales_resolved, "sale_price")
+        repairs_s["sale_price_defaulted_to_zero"] = defaults_s
+
         for k in repairs_total: repairs_total[k] += repairs_s.get(k, 0)
         for k in skipped_total: skipped_total[k] += skipped_s.get(k, 0)
+
         if not sales_resolved.empty:
             sales_insert = _filter_to_table_columns(conn, sales_resolved, "sales", schema=schema)
             out["sales"] = _bulk_insert_core(conn, df=sales_insert, table="sales", schema=schema)
