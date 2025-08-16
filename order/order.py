@@ -48,7 +48,14 @@ def _extract_changes(edited_df: pd.DataFrame) -> pd.DataFrame:
     return only the rows that changed with columns: item_id, old_stock, new_stock.
     """
     if edited_df.empty:
-        return edited_df
+        return pd.DataFrame(columns=["item_id", "old_stock", "new_stock"])
+
+    # Ensure required columns exist
+    required = {"item_id", "current_stock", "new_current_stock"}
+    missing = required - set(edited_df.columns)
+    if missing:
+        # Defensive fallback (nothing to apply)
+        return pd.DataFrame(columns=["item_id", "old_stock", "new_stock"])
 
     # Coerce numeric
     edited_df["current_stock"] = pd.to_numeric(edited_df["current_stock"], errors="coerce").fillna(0).round().astype(int)
@@ -58,7 +65,11 @@ def _extract_changes(edited_df: pd.DataFrame) -> pd.DataFrame:
     if changed.empty:
         return pd.DataFrame(columns=["item_id", "old_stock", "new_stock"])
 
-    changed = changed.rename(columns={"current_stock": "old_stock"})
+    # ✅ Rename both columns so final selection exists
+    changed = changed.rename(columns={
+        "current_stock": "old_stock",
+        "new_current_stock": "new_stock",
+    })
     changed = changed[["item_id", "old_stock", "new_stock"]]
     return changed
 
