@@ -90,61 +90,62 @@ def page() -> None:
     # ───────── Re-order section ───────── #
     st.subheader("🛒 Items that need re-ordering")
     need_df = reorder_suggestions(desired_days, window_days)
-
+    
     if need_df.empty:
         st.success(f"🚀 All items are sufficiently stocked for {desired_days} days.")
     else:
-        edited_need = _editable_grid(
-            need_df,
-            key="need_grid",
-            help_text="Tip: Edit **New Stock** for any item you want to correct, then click **Apply corrections** below.",
-        )
-        changes_need = _extract_changes(edited_need)
-        c1, c2 = st.columns([1, 3])
-        with c1:
-            st.metric("Changed (Re-order)", len(changes_need))
-        with c2:
-            if st.button("✅ Apply corrections (Re-order section)", key="apply_need", use_container_width=False):
-                if changes_need.empty:
-                    st.info("No changes to apply.")
-                else:
-                    res = apply_stock_overrides(rows=changes_need, reason=apply_reason, log_adjustments=log_changes)
-                    st.success(
-                        f"Applied {res['updated']} updates "
-                        f"(Δ total: {res['total_delta']:+d}); "
-                        f"logs inserted: {res['inserted_logs']}"
-                    )
-
+        with st.form("need_form", clear_on_submit=False):
+            edited_need = _editable_grid(
+                need_df,
+                key="need_grid",
+                help_text="Edit **New Stock**. Changes won’t apply until you click Submit.",
+            )
+            changes_need = _extract_changes(edited_need)
+            c1, c2 = st.columns([1, 3])
+            with c1:
+                st.metric("Changed (Re-order)", len(changes_need))
+            submitted_need = st.form_submit_button("✅ Apply corrections (Re-order section)")
+        if 'submitted_need' in locals() and submitted_need:
+            if changes_need.empty:
+                st.info("No changes to apply.")
+            else:
+                res = apply_stock_overrides(rows=changes_need, reason=apply_reason, log_adjustments=log_changes)
+                st.success(
+                    f"Applied {res['updated']} updates "
+                    f"(Δ total: {res['total_delta']:+d}); "
+                    f"logs inserted: {res['inserted_logs']}"
+                )
+    
     st.divider()
-
+    
     # ───────── Over-stock section ───────── #
     st.subheader("📦 Over-stocked items")
     over_df = overstock_items(overstock_days, window_days)
-
+    
     if over_df.empty:
         st.success(f"🎉 No over-stock detected for the next {overstock_days} days.")
     else:
-        edited_over = _editable_grid(
-            over_df,
-            key="over_grid",
-            help_text="Edit **New Stock** to correct. This is great for quickly dialing down obvious over-stock.",
-        )
-        changes_over = _extract_changes(edited_over)
-        c1, c2 = st.columns([1, 3])
-        with c1:
-            st.metric("Changed (Over-stock)", len(changes_over))
-        with c2:
-            if st.button("✅ Apply corrections (Over-stock section)", key="apply_over", use_container_width=False):
-                if changes_over.empty:
-                    st.info("No changes to apply.")
-                else:
-                    res = apply_stock_overrides(rows=changes_over, reason=apply_reason, log_adjustments=log_changes)
-                    st.success(
-                        f"Applied {res['updated']} updates "
-                        f"(Δ total: {res['total_delta']:+d}); "
-                        f"logs inserted: {res['inserted_logs']}"
-                    )
-
+        with st.form("over_form", clear_on_submit=False):
+            edited_over = _editable_grid(
+                over_df,
+                key="over_grid",
+                help_text="Edit **New Stock**. Changes won’t apply until you click Submit.",
+            )
+            changes_over = _extract_changes(edited_over)
+            c1, c2 = st.columns([1, 3])
+            with c1:
+                st.metric("Changed (Over-stock)", len(changes_over))
+            submitted_over = st.form_submit_button("✅ Apply corrections (Over-stock section)")
+        if 'submitted_over' in locals() and submitted_over:
+            if changes_over.empty:
+                st.info("No changes to apply.")
+            else:
+                res = apply_stock_overrides(rows=changes_over, reason=apply_reason, log_adjustments=log_changes)
+                st.success(
+                    f"Applied {res['updated']} updates "
+                    f"(Δ total: {res['total_delta']:+d}); "
+                    f"logs inserted: {res['inserted_logs']}"
+                )
 
 # standalone test
 if __name__ == "__main__":
