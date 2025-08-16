@@ -123,12 +123,7 @@ def overstock_items(
 
 
 # ───────────────────────── New: stock adjustments ───────────────────── #
-@run_transaction
 def _ensure_adjustments_table(conn) -> None:
-    """
-    Create a simple adjustments table if it doesn't exist.
-    Tracks manual corrections made from the Reorder page.
-    """
     conn.execute(text("""
         CREATE TABLE IF NOT EXISTS stock_adjustments (
             id SERIAL PRIMARY KEY,
